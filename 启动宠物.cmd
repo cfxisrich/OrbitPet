@@ -1,2 +1,2 @@
 @echo off
-start "Orbit Pet" pythonw.exe "%~dp0app.py"
+start "Orbit" "%~dp0dist\OrbitPet.exe"

@@ -1,15 +1,18 @@
 import json
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from threading import Event
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+
+from usage_store import UsageRecord
 
 
 class AiError(Exception):
     pass
 
 
-def read_stream(lines: Iterable[bytes], cancelled: Event) -> Iterator[str]:
+def read_stream(lines: Iterable[bytes], cancelled: Event,
+                on_usage: Callable[[UsageRecord], None] | None = None) -> Iterator[str]:
     data = []
     for raw in lines:
         if cancelled.is_set():
@@ -24,6 +27,32 @@ def read_stream(lines: Iterable[bytes], cancelled: Event) -> Iterator[str]:
         data.clear()
         if event["type"] in ("response.output_text.delta", "response.refusal.delta"):
             yield event["delta"]
+        if on_usage is not None and event["type"] in ("response.completed", "response.failed", "response.incomplete"):
+            response = event["response"]
+            if not isinstance(response, dict):
+                raise ValueError("Token 响应格式错误。")
+            usage = response.get("usage")
+            if usage is not None:
+                if not isinstance(usage, dict):
+                    raise ValueError("Token 用量字段格式错误。")
+                input_details = usage.get("input_tokens_details")
+                output_details = usage.get("output_tokens_details")
+                if any(details is not None and not isinstance(details, dict)
+                       for details in (input_details, output_details)):
+                    raise ValueError("Token 明细字段格式错误。")
+                counts = (usage["input_tokens"], usage["output_tokens"], usage["total_tokens"],
+                          input_details.get("cached_tokens", 0) if input_details is not None else 0,
+                          output_details.get("reasoning_tokens", 0) if output_details is not None else 0)
+                occurred_at = response.get("completed_at") or response["created_at"]
+                model = response.get("model", "")
+                if (any(type(value) is not int or value < 0 for value in counts)
+                        or counts[0] + counts[1] != counts[2]
+                        or counts[3] > counts[0] or counts[4] > counts[1]
+                        or not isinstance(response["id"], str) or not response["id"]
+                        or type(occurred_at) is not int or occurred_at < 0
+                        or not isinstance(model, str)):
+                    raise ValueError("Token 用量记录格式错误。")
+                on_usage(UsageRecord(response["id"], "orbit", occurred_at, *counts, model))
         if event["type"] == "response.completed":
             return
         if event["type"] == "response.failed":
@@ -36,7 +65,8 @@ def read_stream(lines: Iterable[bytes], cancelled: Event) -> Iterator[str]:
 
 
 def stream_reply(api_key: str, model: str, messages: list[tuple[str, str]],
-                 task_context: str, cancelled: Event) -> Iterator[str]:
+                 task_context: str, cancelled: Event,
+                 on_usage: Callable[[UsageRecord], None] | None = None) -> Iterator[str]:
     instructions = (
         "你是 Orbit，一只住在 Windows 桌面上的 AI 宠物。用简洁自然的中文交流，"
         "温和、有活力，不要过度卖萌。你只能聊天和解释提供给你的任务快照，"
@@ -60,7 +90,7 @@ def stream_reply(api_key: str, model: str, messages: list[tuple[str, str]],
     )
     try:
         with urlopen(request, timeout=45) as response:
-            yield from read_stream(response, cancelled)
+            yield from read_stream(response, cancelled, on_usage)
     except HTTPError as error:
         labels = {401: "API Key 无效，请在设置中检查。",
                   403: "账户没有访问所选模型的权限。",

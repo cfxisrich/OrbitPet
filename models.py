@@ -13,16 +13,45 @@ class Task:
 
 @dataclass
 class Settings:
+    version: int = 2
     model: str = ""
     api_key: str = ""
     pet_size: int = 200
     topmost: bool = True
     quiet: bool = False
-    x: int = -1
-    y: int = -1
+    pet_visible: bool = True
     monitor: str = ""
-    monitor_left: int = 0
-    monitor_top: int = 0
+    pet_x: int = -1
+    pet_y: int = -1
+    main_geometry: str = ""
+    main_maximized: bool = False
+    focus_minutes: int = 25
+    break_minutes: int = 5
+
+
+@dataclass(frozen=True)
+class Conversation:
+    id: str
+    title: str
+    updated_at: str
+
+
+@dataclass(frozen=True)
+class Message:
+    id: str
+    conversation_id: str
+    role: str
+    content: str
+    status: str
+    created_at: str
+
+
+@dataclass(frozen=True)
+class Activity:
+    id: str
+    text: str
+    kind: str
+    created_at: str
 
 
 STATE_LABELS = {

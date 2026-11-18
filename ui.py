@@ -1,533 +1,853 @@
 import math
-import tkinter as tk
 from pathlib import Path
-from time import monotonic
 
-from models import Settings, Task, STATE_LABELS
-from windows import clamp_position, get_screens, raise_window, screen_for_rect
+from PySide6.QtCore import QByteArray, QRectF, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QTextDocument
+from PySide6.QtWidgets import (
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
+    QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
+    QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
+)
 
-
-BG = "#111B23"
-CARD = "#1B2934"
-MUTED = "#9AAEBB"
-TEXT = "#EDF4F5"
-MINT = "#95E3CC"
-TRANSPARENT = "#010203"
-COLORS = {
-    "idle": MINT, "thinking": "#B7AEFA", "running": "#8BCFF1",
-    "waiting": "#F8D48A", "completed": MINT, "failed": "#F6A4A4",
-    "interrupted": "#D8B8EE", "unknown": MUTED, "offline": MUTED,
-}
+from models import STATE_LABELS, Settings, Task
+from theme import STYLE, icon
+from usage_page import UsagePage
 
 
-class PetUI:
-    def __init__(self, root, settings: Settings, on_send, on_open, on_save, on_quit):
-        self.root = root
+ASSETS = Path(__file__).parent / "assets"
+
+
+def label(text, name="", wrap=False):
+    widget = QLabel(text)
+    widget.setObjectName(name)
+    widget.setWordWrap(wrap)
+    return widget
+
+
+def button(text, callback, primary=False):
+    widget = QPushButton(text)
+    widget.setCursor(Qt.CursorShape.PointingHandCursor)
+    widget.setObjectName("Primary" if primary else "")
+    widget.clicked.connect(callback)
+    return widget
+
+
+def card(name="Card", margins=22):
+    widget = QFrame()
+    widget.setObjectName(name)
+    layout = QVBoxLayout(widget)
+    layout.setContentsMargins(margins, margins, margins, margins)
+    layout.setSpacing(12)
+    return widget, layout
+
+
+def clear_layout(layout):
+    while layout.count():
+        item = layout.takeAt(0)
+        if item.widget():
+            item.widget().hide()
+            item.widget().deleteLater()
+
+
+class ChatEditor(QPlainTextEdit):
+    submitted = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.composing = False
+        self.setPlaceholderText("今天想聊些什么？")
+        self.setFixedHeight(82)
+
+    def inputMethodEvent(self, event):
+        self.composing = bool(event.preeditString())
+        super().inputMethodEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.modifiers() & Qt.KeyboardModifier.ShiftModifier and not self.composing:
+            self.submitted.emit()
+            return
+        super().keyPressEvent(event)
+
+
+class MarkdownView(QTextBrowser):
+    def __init__(self):
+        super().__init__()
+        self.setOpenLinks(False)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.document().setDefaultStyleSheet("p { margin: 5px 0; } pre { background: #F0F4EF; padding: 12px; font-family: Consolas; } code { font-family: Consolas; } a { color: #33866B; }")
+        self.document().documentLayout().documentSizeChanged.connect(self.fit_height)
+        self.anchorClicked.connect(self.open_link)
+
+    def loadResource(self, resource_type, url):
+        if resource_type == QTextDocument.ResourceType.ImageResource:
+            return QByteArray()
+        return super().loadResource(resource_type, url)
+
+    def open_link(self, url):
+        if url.scheme() in ("https", "http"):
+            QDesktopServices.openUrl(url)
+
+    def fit_height(self):
+        self.setFixedHeight(max(34, math.ceil(self.document().size().height()) + 12))
+
+    def set_content(self, text):
+        self.document().setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML)
+        self.fit_height()
+
+
+class MessageCard(QFrame):
+    def __init__(self, message):
+        super().__init__()
+        self.content = ""
+        self.status = ""
+        self.setObjectName("UserMessage" if message.role == "user" else "Card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 12, 18, 14)
+        layout.setSpacing(3)
+        header = QHBoxLayout()
+        header.addWidget(label("你" if message.role == "user" else "小新 · Orbit", "SectionTitle"))
+        header.addStretch()
+        self.status_label = label("", "Muted")
+        header.addWidget(self.status_label)
+        copy_button = button("复制", lambda: QApplication.clipboard().setText(self.content))
+        copy_button.setObjectName("Quiet")
+        header.addWidget(copy_button)
+        layout.addLayout(header)
+        self.body = MarkdownView()
+        layout.addWidget(self.body)
+        self.update_message(message.content, message.status)
+
+    def update_message(self, content, status):
+        if self.content != content or self.status != status:
+            self.content, self.status = content, status
+            self.body.set_content(content or ("正在想一想…" if status == "streaming" else "本次回复没有内容。"))
+            self.status_label.setText({"streaming": "正在回复", "error": "回复失败", "interrupted": "回复已中断", "completed": ""}[status])
+
+
+class FocusDial(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.remaining = 25 * 60
+        self.total = 25 * 60
+        self.caption = "准备好，开始一段专注"
+        self.setMinimumHeight(230)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        diameter = min(self.width() - 24, self.height() - 20, 270)
+        painter.translate(self.width() / 2, self.height() / 2)
+        painter.setPen(QPen(QColor("#E6F0E7"), 9))
+        painter.drawEllipse(QRectF(-diameter / 2, -diameter / 2, diameter, diameter))
+        pen = QPen(QColor("#6ABD99"), 9)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawArc(QRectF(-diameter / 2, -diameter / 2, diameter, diameter), 90 * 16,
+                        -round(360 * 16 * min(1, self.remaining / self.total)))
+        painter.setPen(QColor("#25332F"))
+        painter.setFont(QFont("Segoe UI", 37, QFont.Weight.DemiBold))
+        seconds = max(0, math.ceil(self.remaining))
+        painter.drawText(QRectF(-diameter / 2, -40, diameter, 65), Qt.AlignmentFlag.AlignCenter, f"{seconds // 60:02}:{seconds % 60:02}")
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
+        painter.setPen(QColor("#7B8B81"))
+        painter.drawText(QRectF(-diameter / 2, 30, diameter, 30), Qt.AlignmentFlag.AlignCenter, self.caption)
+
+
+class MainWindow(QMainWindow):
+    send_requested = Signal(str, bool)
+    new_chat_requested = Signal()
+    select_chat_requested = Signal(str)
+    rename_chat_requested = Signal(str, str)
+    delete_chat_requested = Signal(str)
+    open_codex_requested = Signal(str)
+    pet_visibility_requested = Signal(bool)
+    pet_size_requested = Signal(int)
+    pet_topmost_requested = Signal(bool)
+    pet_restore_requested = Signal()
+    pet_interact_requested = Signal(str)
+    focus_action_requested = Signal(str)
+    focus_config_requested = Signal(int, int)
+    settings_save_requested = Signal(str, str, bool, bool)
+    quit_requested = Signal()
+    usage_requested = Signal(str, str, str)
+    usage_refresh_requested = Signal()
+
+    def __init__(self, settings: Settings, data_dir: Path):
+        super().__init__()
         self.settings = settings
-        self.on_send = on_send
-        self.on_open = on_open
-        self.on_save = on_save
-        self.on_quit = on_quit
-        self.state = "idle"
-        self.base_state = "idle"
-        self.state_started = monotonic()
-        self.message = ""
-        self.tasks = []
-        self.frame = 0
-        self.dragged = False
+        self.form_snapshot = (settings.api_key, settings.model, settings.focus_minutes,
+                              settings.break_minutes, settings.quiet, settings.pet_visible)
+        self.data_dir = data_dir
+        self.selected_id = ""
+        self.message_conversation = ""
         self.busy = False
-        self.bubble_timer = None
-        self.current_tab = "chat"
-        self.panel_height = min(690, root.winfo_screenheight() - 70)
-        self.last_task_signature = ()
-        self.font = ("Microsoft YaHei UI", 10)
-        self.screens = get_screens()
-        root.title("Orbit · 桌面宠物")
-        self.app_icon = tk.PhotoImage(master=root, data=(Path(__file__).parent / "assets" / "orbit.png").read_bytes(), format="png")
-        root.iconphoto(True, self.app_icon)
-        root.configure(bg=TRANSPARENT)
-        root.overrideredirect(True)
-        root.attributes("-transparentcolor", TRANSPARENT)
-        root.attributes("-topmost", settings.topmost)
-        self.canvas = tk.Canvas(root, bg=TRANSPARENT, highlightthickness=0)
-        self.canvas.pack(fill="both", expand=True)
-        self.canvas.bind("<ButtonPress-1>", self._drag_start)
-        self.canvas.bind("<B1-Motion>", self._drag_move)
-        self.canvas.bind("<ButtonRelease-1>", self._drag_end)
-        self.canvas.bind("<Button-3>", self._context_menu)
-        self.topmost_var = tk.BooleanVar(value=settings.topmost)
-        self.quiet_var = tk.BooleanVar(value=settings.quiet)
-        self.size_var = tk.IntVar(value=settings.pet_size)
-        self.menu = tk.Menu(root, tearoff=False, bg=CARD, fg=TEXT,
-                            activebackground="#304657", activeforeground=TEXT, font=self.font)
-        self.menu.add_command(label="和 Orbit 聊聊", command=self.show_panel)
-        self.menu.add_command(label="查看 Codex 任务", command=lambda: self.show_panel("tasks"))
-        self.menu.add_command(label="打开 Codex", command=lambda: on_open(""))
-        self.menu.add_separator()
-        self.menu.add_checkbutton(label="总在最前", variable=self.topmost_var,
-                                  command=self._quick_settings)
-        self.menu.add_checkbutton(label="免打扰", variable=self.quiet_var,
-                                  command=self._quick_settings)
-        size_menu = tk.Menu(self.menu, tearoff=False, bg=CARD, fg=TEXT, font=self.font)
-        for label, size in [("小 · 160", 160), ("中 · 200", 200), ("大 · 240", 240)]:
-            size_menu.add_radiobutton(label=label, value=size, variable=self.size_var,
-                                      command=self._quick_settings)
-        self.menu.add_cascade(label="宠物大小", menu=size_menu)
-        self.menu.add_command(label="设置", command=lambda: self.show_panel("settings"))
-        self.menu.add_separator()
-        self.menu.add_command(label="退出 Orbit", command=on_quit)
-        self.pet_source = tk.PhotoImage(master=root, data=(Path(__file__).parent / "assets" / "shinchan.png").read_bytes(), format="png")
-        self.pet_base = self.pet_source.subsample(max(1, max(self.pet_source.width(), self.pet_source.height()) // 200))
-        self.image_size = 0
-        self._resize_pet()
-        self.panel = tk.Toplevel(root)
-        self.panel.withdraw()
-        self.panel.title("Orbit · AI 桌面伙伴")
-        self.panel.configure(bg=BG)
-        self.panel.resizable(False, False)
-        self.panel.attributes("-topmost", settings.topmost)
-        self.panel.protocol("WM_DELETE_WINDOW", self.panel.withdraw)
-        self.panel.bind("<Escape>", lambda event: self.panel.withdraw())
-        self.panel.bind("<MouseWheel>", self._scroll_tasks)
-        self._build_panel()
-        self._build_pet()
-        self._animate()
-        self.root.after(2000, self._keep_visible)
-
-    def _button(self, parent, text, command, accent=False, **options):
-        color = MINT if accent else CARD
-        button = tk.Button(parent, text=text, command=command, bg=color,
-                           fg=BG if accent else TEXT, activebackground="#B8F1E0" if accent else "#304657",
-                           activeforeground=BG if accent else TEXT, relief="flat", bd=0,
-                           cursor="hand2", font=self.font, padx=12, pady=7, **options)
-        return button
-
-    def _build_panel(self):
-        shell = tk.Frame(self.panel, bg=BG, highlightbackground="#34444E", highlightthickness=1)
-        shell.pack(fill="both", expand=True)
-        header = tk.Frame(shell, bg=BG)
-        header.pack(fill="x", padx=22, pady=(19, 10))
-        logo = tk.Label(header, text="◉  ORBIT", font=("Segoe UI", 17, "bold"), bg=BG, fg=MINT)
-        logo.pack(side="left")
-        self._button(header, "×", self.panel.withdraw).pack(side="right")
-        for widget in (header, logo):
-            widget.bind("<ButtonPress-1>", self._panel_drag_start)
-            widget.bind("<B1-Motion>", self._panel_drag_move)
-        tk.Label(shell, text="陪你聊天，也陪你等代码完成。", bg=BG, fg=MUTED,
-                 font=self.font).pack(anchor="w", padx=24, pady=(0, 15))
-        status_row = tk.Frame(shell, bg=CARD)
-        status_row.pack(fill="x", padx=22, pady=(0, 17))
-        self.status_label = tk.Label(status_row, text="●  空闲", font=self.font, fg=MINT, bg=CARD)
-        self.status_label.pack(side="left", padx=12, pady=9)
-        self._button(status_row, "打开 Codex ↗", lambda: self.on_open("")).pack(side="right", padx=2)
-        tabbar = tk.Frame(shell, bg=BG)
-        tabbar.pack(fill="x", padx=22)
-        self.tab_buttons = {}
-        self.tabs = {}
-        for name, label in [("chat", "聊一聊"), ("tasks", "Codex 任务"), ("settings", "设置")]:
-            button = self._button(tabbar, label, lambda tab=name: self._select_tab(tab))
-            button.pack(side="left", fill="x", expand=True, padx=(0, 5))
-            self.tab_buttons[name] = button
-            self.tabs[name] = tk.Frame(shell, bg=BG)
+        self.tasks: list[Task] = []
+        self.message_cards: dict[str, MessageCard] = {}
+        self.conversation_titles: dict[str, str] = {}
+        self.scroll_positions: dict[str, int] = {}
+        self.current_page = "home"
+        self.geometry_ready = False
+        self.pet_image = QPixmap()
+        self.pet_image.loadFromData((ASSETS / "shinchan.png").read_bytes())
+        self.setWindowTitle("Orbit · 小新桌面助手")
+        self.setWindowIcon(QIcon(str(ASSETS / "orbit.ico")))
+        self.setStyleSheet(STYLE)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        shell = QWidget()
+        shell.setObjectName("Page")
+        shell_layout = QHBoxLayout(shell)
+        shell_layout.setContentsMargins(0, 0, 0, 0)
+        shell_layout.setSpacing(0)
+        self.setCentralWidget(shell)
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("Sidebar")
+        self.sidebar.setFixedWidth(210)
+        side_layout = QVBoxLayout(self.sidebar)
+        side_layout.setContentsMargins(20, 30, 20, 20)
+        side_layout.setSpacing(9)
+        brand = QHBoxLayout()
+        app_image = QPixmap()
+        app_image.loadFromData((ASSETS / "orbit.png").read_bytes())
+        brand_icon = QLabel()
+        brand_icon.setPixmap(app_image.scaled(43, 43, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        brand.addWidget(brand_icon)
+        brand_text = QVBoxLayout()
+        brand_text.setSpacing(0)
+        brand_text.addWidget(label("Orbit", "Brand"))
+        brand_text.addWidget(label("小新桌面助手", "Muted"))
+        brand.addLayout(brand_text)
+        brand.addStretch()
+        side_layout.addLayout(brand)
+        side_layout.addSpacing(32)
+        side_layout.addWidget(label("你的陪伴空间", "Muted"))
+        side_layout.addSpacing(4)
+        self.nav_buttons = {}
+        self.stack = QStackedWidget()
+        self.pages = {}
+        for name, title in (("home", "首页"), ("chat", "AI 聊天"), ("tasks", "Codex 任务"), ("usage", "Token 用量"), ("pet", "宠物空间"), ("focus", "专注时间"), ("settings", "设置")):
+            nav = button("  " + title, lambda checked=False, page=name: self._select_page(page))
+            nav.setObjectName("Nav")
+            nav.setIcon(icon(name))
+            nav.setIconSize(QSize(20, 20))
+            nav.setCheckable(True)
+            side_layout.addWidget(nav)
+            self.nav_buttons[name] = nav
+        side_layout.addStretch()
+        self.side_note, note_layout = card("SoftCard", 14)
+        note_layout.addWidget(label("●  小新在这里", "SectionTitle"))
+        note_layout.addWidget(label("陪你聊天，也陪你等代码完成。", "Muted", True))
+        side_layout.addWidget(self.side_note)
+        side_layout.addSpacing(4)
+        self.side_footer = label("ORBIT 2.1  /  MADE FOR YOUR DAY", "Muted", True)
+        side_layout.addWidget(self.side_footer)
+        shell_layout.addWidget(self.sidebar)
+        shell_layout.addWidget(self.stack, 1)
+        self._build_home()
         self._build_chat()
         self._build_tasks()
+        self.usage_page = UsagePage()
+        self.usage_page.requested.connect(self.usage_requested.emit)
+        self.usage_page.refresh_requested.connect(self.usage_refresh_requested.emit)
+        self.pages['usage'] = self.stack.addWidget(self.usage_page)
+        self._build_pet()
+        self._build_focus()
         self._build_settings()
-        footer = tk.Frame(shell, bg=BG)
-        footer.pack(side="bottom", fill="x", padx=22, pady=(0, 13))
-        tk.Label(footer, text="ORBIT  /  DESKTOP COMPANION", font=("Segoe UI", 8),
-                 fg="#6D8796", bg=BG).pack(side="left")
-        tk.Button(footer, text="找回宠物", command=self.restore_pet, relief="flat", bd=0,
-                  bg=BG, fg=MINT, activebackground=CARD, activeforeground=TEXT,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="left", padx=12)
-        tk.Button(footer, text="退出", command=self.on_quit, relief="flat", bd=0,
-                  bg=BG, fg=MUTED, activebackground=CARD, activeforeground=TEXT,
-                  font=("Microsoft YaHei UI", 9), cursor="hand2").pack(side="right")
-        self._select_tab("chat")
+        self._select_page("home")
+        self.statusBar().setSizeGripEnabled(True)
+        self.statusBar().showMessage("小新已准备好。任务监测正在连接本机 Codex…")
+        available = QApplication.primaryScreen().availableGeometry()
+        self.resize(min(1120, available.width() - 36), min(760, available.height() - 44))
+        self.setMinimumSize(min(740, available.width() - 24), min(520, available.height() - 24))
+        if settings.main_geometry:
+            self.restoreGeometry(QByteArray.fromHex(settings.main_geometry.encode()))
+        if not any(screen.availableGeometry().intersects(self.frameGeometry()) for screen in QApplication.screens()):
+            self.move(available.center() - self.rect().center())
+        self.geometry_ready = True
+        self.sync_settings()
+
+    def _page(self, name, title, subtitle, scroll=False):
+        page = QWidget()
+        page.setObjectName("Page")
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(28, 26, 28, 22)
+        layout.setSpacing(18)
+        heading = QVBoxLayout()
+        heading.setSpacing(5)
+        heading.addWidget(label(title, "Title"))
+        heading.addWidget(label(subtitle, "Muted", True))
+        layout.addLayout(heading)
+        self.pages[name] = self.stack.count()
+        if scroll:
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setWidget(page)
+            self.stack.addWidget(area)
+            return layout
+        self.stack.addWidget(page)
+        return layout
+
+    def _build_home(self):
+        layout = self._page("home", "每一天，都有小新陪你", "你的桌面小伙伴，也是一间安静的工作室。", True)
+        hero, hero_layout = card("Hero", 22)
+        row = QHBoxLayout()
+        words = QVBoxLayout()
+        words.setSpacing(9)
+        eyebrow = label("HELLO, FRIEND", "Muted")
+        words.addWidget(eyebrow)
+        words.addWidget(label("一起把今天\n过得有趣一点。", "HeroTitle"))
+        words.addWidget(label("和我聊聊，或者安心做事。\n我会替你留意 Codex 的任务动态。", "Muted", True))
+        actions = QHBoxLayout()
+        actions.addWidget(button("和小新聊聊  →", lambda: self._select_page("chat"), True))
+        actions.addWidget(button("打开 Codex  ↗", lambda: self.open_codex_requested.emit("")))
+        actions.addStretch()
+        words.addLayout(actions)
+        row.addLayout(words, 1)
+        self.home_pet = QLabel()
+        self.home_pet.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.home_pet.setPixmap(self.pet_image.scaled(185, 185, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        row.addWidget(self.home_pet)
+        hero_layout.addLayout(row)
+        layout.addWidget(hero)
+        stats = QHBoxLayout()
+        stats.setSpacing(14)
+        self.stat_values = {}
+        for key, title, subtitle in (("running", "正在进行", "当前监测的 Codex 聊天"), ("completed", "本轮完成", "最近 20 个聊天中的记录"), ("focus", "今日专注", "已完成的专注分钟")):
+            box, content = card(margins=16)
+            content.setSpacing(4)
+            content.addWidget(label(title, "Muted"))
+            self.stat_values[key] = label("—" if key != "focus" else "0", "Stat")
+            content.addWidget(self.stat_values[key])
+            content.addWidget(label(subtitle, "Muted", True))
+            stats.addWidget(box, 1)
+        layout.addLayout(stats)
+        self.home_monitor = label("监测范围：本机最近 20 个未归档主聊天", "Muted", True)
+        layout.addWidget(self.home_monitor)
+        bottom = QHBoxLayout()
+        bottom.setSpacing(14)
+        activity_box, activity_layout = card()
+        activity_layout.addWidget(label("最近动态", "SectionTitle"))
+        self.home_activity = QVBoxLayout()
+        self.home_activity.setSpacing(12)
+        self.home_activity.addWidget(label("这里会记录任务进展与专注时刻。", "Muted", True))
+        activity_layout.addLayout(self.home_activity)
+        activity_layout.addStretch()
+        bottom.addWidget(activity_box, 3)
+        quick_box, quick_layout = card("SoftCard", 18)
+        quick_layout.setSpacing(8)
+        quick_layout.addWidget(label("给自己一点专注时间", "SectionTitle", True))
+        self.home_timer = label("25:00", "Stat")
+        quick_layout.addWidget(self.home_timer)
+        quick_layout.addWidget(label("一次只做一件事，小新陪你。", "Muted", True))
+        quick_layout.addWidget(button("进入专注  →", lambda: self._select_page("focus"), True))
+        quick_layout.addWidget(button("找回桌面上的小新", self.pet_restore_requested.emit))
+        bottom.addWidget(quick_box, 2)
+        layout.addLayout(bottom)
+        layout.addStretch()
 
     def _build_chat(self):
-        frame = self.tabs["chat"]
-        self.chat = tk.Text(frame, bg=BG, fg=TEXT, font=self.font, relief="flat", bd=0,
-                            wrap="word", height=1, padx=4, pady=8, cursor="arrow",
-                            selectbackground="#355569", spacing1=5, spacing3=6,
-                            highlightthickness=0, state="disabled")
-        self.chat.pack(fill="both", expand=True)
-        self.chat.tag_configure("orbit", foreground=MINT, font=("Segoe UI", 10, "bold"))
-        self.chat.tag_configure("you", foreground="#B6CFF5", font=("Microsoft YaHei UI", 10, "bold"))
-        self.chat.tag_configure("error", foreground="#F6A4A4")
-        self.chat.configure(state="normal")
-        self.chat.insert("end", "ORBIT\n", "orbit")
-        self.chat.insert("end", "你好，我是你的桌面小伙伴。\n\n先在设置中连接 AI，然后就可以和我聊天了。任务面板会显示本机 Codex 的真实记录。\n")
-        self.chat.configure(state="disabled")
-        self.include_tasks = tk.BooleanVar(value=False)
-        tk.Checkbutton(frame, text="结合当前任务状态", variable=self.include_tasks,
-                       font=("Microsoft YaHei UI", 9), bg=BG, fg=MUTED,
-                       selectcolor=CARD, activebackground=BG, activeforeground=TEXT,
-                       highlightthickness=0, bd=0).pack(anchor="w", pady=(8, 4))
-        entry_row = tk.Frame(frame, bg=CARD, highlightbackground="#344C58", highlightthickness=1)
-        entry_row.pack(fill="x", pady=(0, 12))
-        self.input = tk.Entry(entry_row, font=self.font, bg=CARD, fg=TEXT,
-                              insertbackground=MINT, relief="flat", bd=0)
-        self.input.pack(side="left", fill="x", expand=True, padx=12, pady=12)
-        self.input.bind("<Return>", self._send)
-        self.send_button = self._button(entry_row, "发送 ↑", self._send, True)
-        self.send_button.pack(side="right", padx=4, pady=4)
+        layout = self._page("chat", "和小新聊一聊", "想法、灵感，或者今天的小心事，都可以放在这里。")
+        splitter = QSplitter()
+        splitter.setChildrenCollapsible(False)
+        left, left_layout = card(margins=12)
+        left.setMinimumWidth(150)
+        left_layout.addWidget(button("＋  新对话", self.new_chat_requested.emit, True))
+        self.conversation_list = QListWidget()
+        self.conversation_list.setWordWrap(True)
+        self.conversation_list.currentItemChanged.connect(self._conversation_selected)
+        left_layout.addWidget(self.conversation_list, 1)
+        chat_tools = QHBoxLayout()
+        self.rename_button = button("重命名", self._rename_chat)
+        self.delete_button = button("删除", self._delete_chat)
+        self.rename_button.setObjectName("Quiet")
+        self.delete_button.setObjectName("Quiet")
+        chat_tools.addWidget(self.rename_button)
+        chat_tools.addWidget(self.delete_button)
+        left_layout.addLayout(chat_tools)
+        splitter.addWidget(left)
+        right = QWidget()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(4, 0, 0, 0)
+        right_layout.setSpacing(12)
+        self.chat_title = label("新的故事，从这里开始", "SectionTitle")
+        right_layout.addWidget(self.chat_title)
+        self.message_scroll = QScrollArea()
+        self.message_scroll.setWidgetResizable(True)
+        self.message_host = QWidget()
+        self.message_host.setObjectName("MessageHost")
+        self.message_host.setStyleSheet("#MessageHost { background: transparent; }")
+        self.message_layout = QVBoxLayout(self.message_host)
+        self.message_layout.setContentsMargins(0, 0, 8, 0)
+        self.message_layout.setSpacing(12)
+        self.message_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        self.message_scroll.setWidget(self.message_host)
+        right_layout.addWidget(self.message_scroll, 1)
+        compose, compose_layout = card(margins=12)
+        self.chat_input = ChatEditor()
+        self.chat_input.submitted.connect(self._send)
+        compose_layout.addWidget(self.chat_input)
+        compose_footer = QHBoxLayout()
+        self.include_tasks = QCheckBox("结合当前任务状态")
+        self.include_tasks.setToolTip("选中后，发送当前任务的标题、状态与时间；不会读取 Codex 聊天正文。")
+        compose_footer.addWidget(self.include_tasks)
+        compose_footer.addStretch()
+        self.send_button = button("发送  ↑", self._send, True)
+        compose_footer.addWidget(self.send_button)
+        compose_layout.addLayout(compose_footer)
+        right_layout.addWidget(compose)
+        self.chat_hint = label("Enter 发送 · Shift+Enter 换行 · 会话仅保存在本机", "Muted", True)
+        right_layout.addWidget(self.chat_hint)
+        splitter.addWidget(right)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([200, 620])
+        layout.addWidget(splitter, 1)
+        self.set_messages([])
 
     def _build_tasks(self):
-        frame = self.tabs["tasks"]
-        self.connection_label = tk.Label(frame, text="正在读取本机任务…", bg=BG, fg=MUTED,
-                                         font=("Microsoft YaHei UI", 9), anchor="w", wraplength=364)
-        self.connection_label.pack(fill="x", pady=(12, 10))
-        scroll = tk.Scrollbar(frame, orient="vertical", relief="flat", bd=0)
-        self.task_canvas = tk.Canvas(frame, bg=BG, highlightthickness=0, yscrollcommand=scroll.set)
-        scroll.configure(command=self.task_canvas.yview)
-        scroll.pack(side="right", fill="y")
-        self.task_canvas.pack(side="left", fill="both", expand=True)
-        self.task_list = tk.Frame(self.task_canvas, bg=BG)
-        self.task_window = self.task_canvas.create_window(0, 0, window=self.task_list, anchor="nw")
-        self.task_list.bind("<Configure>", lambda event: self.task_canvas.configure(
-            scrollregion=self.task_canvas.bbox("all")))
-        self.task_canvas.bind("<Configure>", lambda event: self.task_canvas.itemconfigure(
-            self.task_window, width=event.width))
-        self.empty_tasks = tk.Label(self.task_list, text="暂时没有任务\n在 Codex 中开始一次对话吧。",
-                                    bg=BG, fg=MUTED, font=self.font, pady=50)
-        self.empty_tasks.pack(fill="x")
-
-    def _build_settings(self):
-        frame = self.tabs["settings"]
-        tk.Label(frame, text="AI 连接", font=("Microsoft YaHei UI", 11, "bold"),
-                 bg=BG, fg=TEXT).pack(anchor="w", pady=(16, 9))
-        tk.Label(frame, text="OpenAI API Key · 仅本次运行使用", font=("Microsoft YaHei UI", 9),
-                 bg=BG, fg=MUTED).pack(anchor="w")
-        self.key_var = tk.StringVar(value=self.settings.api_key)
-        tk.Entry(frame, textvariable=self.key_var, show="●", bg=CARD, fg=TEXT,
-                 insertbackground=MINT, relief="flat", font=self.font).pack(fill="x", ipady=8, pady=(5, 10))
-        tk.Label(frame, text="模型名称 · 填写账户可用的模型", bg=BG, fg=MUTED,
-                 font=("Microsoft YaHei UI", 9)).pack(anchor="w")
-        self.model_var = tk.StringVar(value=self.settings.model)
-        tk.Entry(frame, textvariable=self.model_var, bg=CARD, fg=TEXT,
-                 insertbackground=MINT, relief="flat", font=self.font).pack(fill="x", ipady=8, pady=(5, 7))
-        tk.Label(frame, text="也可通过 OPENAI_API_KEY / OPENAI_MODEL 设置。",
-                 bg=BG, fg=MUTED, font=("Microsoft YaHei UI", 8)).pack(anchor="w")
-        tk.Label(frame, text="桌面偏好", font=("Microsoft YaHei UI", 11, "bold"),
-                 bg=BG, fg=TEXT).pack(anchor="w", pady=(18, 6))
-        toggles = tk.Frame(frame, bg=BG)
-        toggles.pack(fill="x")
-        for text, variable in [("总在最前", self.topmost_var), ("免打扰", self.quiet_var)]:
-            tk.Checkbutton(toggles, text=text, variable=variable, font=self.font,
-                           bg=BG, fg=TEXT, selectcolor=CARD, activebackground=BG,
-                           activeforeground=TEXT, bd=0, highlightthickness=0).pack(side="left", padx=(0, 14))
-        size_row = tk.Frame(frame, bg=BG)
-        size_row.pack(fill="x", pady=(5, 8))
-        tk.Label(size_row, text="宠物大小", bg=BG, fg=MUTED, font=self.font).pack(side="left")
-        tk.Scale(size_row, from_=160, to=260, resolution=20, orient="horizontal",
-                 variable=self.size_var, bg=BG, fg=TEXT, troughcolor=CARD,
-                 activebackground=MINT, highlightthickness=0, bd=0,
-                 font=("Segoe UI", 9), length=230).pack(side="right")
-        self._button(frame, "保存设置", self._save_settings, True).pack(fill="x", pady=(5, 8))
-        self.settings_note = tk.Label(frame, text="当前形象：你提供的小新。",
-                                      font=("Microsoft YaHei UI", 8), fg=MUTED, bg=BG, wraplength=370)
-        self.settings_note.pack(anchor="w")
-
-    def _select_tab(self, tab):
-        for name, frame in self.tabs.items():
-            frame.pack_forget()
-            self.tab_buttons[name].configure(bg=MINT if name == tab else CARD,
-                                             fg=BG if name == tab else MUTED)
-        self.current_tab = tab
-        self.tabs[tab].pack(fill="both", expand=True, padx=22, pady=(4, 6))
-
-    def show_panel(self, tab="chat"):
-        self.show_pet()
-        self._select_tab(tab)
-        screen = screen_for_rect(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, self.screens)
-        self.panel_height = min(690, screen.bottom - screen.top - 40)
-        x, y = clamp_position(self.root.winfo_x() - 440, self.root.winfo_y() - 340,
-                              430, self.panel_height + 40, screen)
-        self.panel.geometry(f"430x{self.panel_height}+{x}+{y}")
-        self.panel.deiconify()
-        self.panel.lift()
-        if tab == "chat":
-            self.input.focus_set()
-
-    def show_pet(self):
-        self.root.update_idletasks()
-        screen = screen_for_rect(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, self.screens)
-        x, y = clamp_position(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, screen)
-        if (x, y) != (self.root.winfo_x(), self.root.winfo_y()):
-            self.root.geometry(f"+{x}+{y}")
-            self._remember_position(x, y, screen)
-            self.on_save()
-        if not self.root.winfo_ismapped():
-            self.root.deiconify()
-        self.root.attributes("-topmost", self.settings.topmost)
-        raise_window(self.root.winfo_id(), self.settings.topmost)
-        if self.panel.state() == "normal":
-            raise_window(self.panel.winfo_id(), self.settings.topmost)
-
-    def restore_pet(self):
-        self.settings.monitor = ""
-        self.settings.x = -1
-        self.settings.y = -1
-        self._resize_pet()
-        self.show_pet()
-        self.on_save()
-
-    def _keep_visible(self):
-        screens = get_screens()
-        if screens != self.screens:
-            self.screens = screens
-            self._resize_pet()
-            self.on_save()
-            if self.panel.state() == "normal":
-                self.show_panel(self.current_tab)
-        screen = screen_for_rect(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, self.screens)
-        if self.settings.topmost and (
-            not self.root.winfo_ismapped()
-            or not self.root.attributes("-topmost")
-            or clamp_position(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, screen)
-            != (self.root.winfo_x(), self.root.winfo_y())
-        ):
-            self.show_pet()
-        self.root.after(2000, self._keep_visible)
-
-    def _send(self, event=None):
-        if self.busy or not self.input.get().strip():
-            return
-        self.on_send(self.input.get().strip(), self.include_tasks.get())
-
-    def start_reply(self, user_text):
-        self.busy = True
-        self.input.delete(0, "end")
-        self.input.configure(state="disabled")
-        self.send_button.configure(state="disabled", text="回复中")
-        self.chat.configure(state="normal")
-        self.chat.insert("end", "\n你\n", "you")
-        self.chat.insert("end", user_text + "\n\n")
-        self.chat.insert("end", "ORBIT\n", "orbit")
-        self.chat.configure(state="disabled")
-        self.chat.see("end")
-
-    def append_reply(self, text):
-        self.chat.configure(state="normal")
-        self.chat.insert("end", text)
-        self.chat.configure(state="disabled")
-        self.chat.see("end")
-
-    def finish_reply(self, error=""):
-        self.busy = False
-        self.chat.configure(state="normal")
-        if error:
-            self.chat.insert("end", "\n" + error, "error")
-        self.chat.insert("end", "\n")
-        self.chat.configure(state="disabled")
-        self.input.configure(state="normal")
-        self.send_button.configure(state="normal", text="发送 ↑")
-        self.chat.see("end")
-
-    def set_tasks(self, tasks: list[Task], connection_message):
-        self.tasks = tasks
-        self.connection_label.configure(text=connection_message)
-        signature = tuple(tasks)
-        if signature == self.last_task_signature:
-            return
-        self.last_task_signature = signature
-        for child in self.task_list.winfo_children():
-            child.destroy()
-        if not tasks:
-            tk.Label(self.task_list, text="暂时没有任务\n在 Codex 中开始一次对话吧。",
-                     bg=BG, fg=MUTED, font=self.font, pady=50).pack(fill="x")
-            return
-        for task in tasks[:20]:
-            card = tk.Frame(self.task_list, bg=CARD, padx=13, pady=12)
-            card.pack(fill="x", pady=(0, 9), padx=(0, 5))
-            headline = tk.Frame(card, bg=CARD)
-            headline.pack(fill="x")
-            tk.Label(headline, text="● " + STATE_LABELS[task.state], bg=CARD,
-                     fg=COLORS[task.state], font=("Microsoft YaHei UI", 9)).pack(side="left")
-            tk.Button(headline, text="打开 ↗", bg=CARD, fg=MINT, activebackground="#304657",
-                      activeforeground=MINT, relief="flat", bd=0, cursor="hand2",
-                      font=("Microsoft YaHei UI", 9), command=lambda tid=task.id: self.on_open(tid)).pack(side="right")
-            tk.Label(card, text=task.title, bg=CARD, fg=TEXT, font=self.font,
-                     wraplength=330, justify="left", anchor="w").pack(fill="x", pady=(7, 4))
-            tk.Label(card, text=task.detail, bg=CARD, fg=MUTED, font=("Microsoft YaHei UI", 9),
-                     wraplength=330, justify="left", anchor="w").pack(fill="x")
-            tk.Label(card, text=task.updated_at, bg=CARD, fg="#7691A1", font=("Segoe UI", 8),
-                     anchor="w").pack(fill="x", pady=(8, 0))
-
-    def set_pet_state(self, state, message=""):
-        self.base_state = state
-        if message:
-            self.notify(message, state)
-            return
-        if not self.message:
-            self._display_state(state)
-
-    def _display_state(self, state):
-        if self.state == state:
-            return
-        self.state = state
-        self.state_started = monotonic()
-        self.status_label.configure(text="●  " + STATE_LABELS[state], fg=COLORS[state])
-
-    def notify(self, message, state):
-        if self.settings.quiet:
-            return
-        self._display_state(state)
-        self.state_started = monotonic()
-        self.message = message if len(message) <= 34 else message[:33] + "…"
-        if self.bubble_timer is not None:
-            self.root.after_cancel(self.bubble_timer)
-        self.bubble_timer = self.root.after(7000, self._hide_bubble)
-
-    def _hide_bubble(self):
-        self.message = ""
-        self.bubble_timer = None
-        self._display_state(self.base_state)
-
-    def _save_settings(self):
-        self.settings.model = self.model_var.get().strip()
-        self.settings.api_key = self.key_var.get().strip()
-        self._quick_settings()
-        self.settings_note.configure(text="已保存。API Key 仅保留在本次运行的内存中。", fg=MINT)
-
-    def _quick_settings(self):
-        self.settings.topmost = self.topmost_var.get()
-        self.settings.quiet = self.quiet_var.get()
-        self.settings.pet_size = self.size_var.get()
-        self.root.attributes("-topmost", self.settings.topmost)
-        self.panel.attributes("-topmost", self.settings.topmost)
-        self._resize_pet()
-        if self.settings.quiet:
-            if self.bubble_timer is not None:
-                self.root.after_cancel(self.bubble_timer)
-            self._hide_bubble()
-        self.on_save()
-
-    def _resize_pet(self):
-        self.scale = self.settings.pet_size / 200
-        if self.image_size != self.settings.pet_size:
-            self.pet_image = self.pet_base.zoom(round(self.settings.pet_size / 20)).subsample(
-                max(1, round(max(self.pet_base.width(), self.pet_base.height()) / 21)))
-            self.image_size = self.settings.pet_size
-        self.width = round(260 * self.scale)
-        self.height = round(290 * self.scale)
-        screen = next((item for item in self.screens if item.name == self.settings.monitor),
-                      screen_for_rect(self.settings.x, self.settings.y, self.width, self.height, self.screens))
-        saved_position = self.settings.monitor == screen.name or (
-            not self.settings.monitor and (self.settings.x, self.settings.y) != (-1, -1))
-        x = (self.settings.x + (screen.left - self.settings.monitor_left if self.settings.monitor else 0)
-             if saved_position else screen.right - self.width - 35)
-        y = (self.settings.y + (screen.top - self.settings.monitor_top if self.settings.monitor else 0)
-             if saved_position else screen.bottom - self.height - 20)
-        x, y = clamp_position(x, y, self.width, self.height, screen)
-        self._remember_position(x, y, screen)
-        self.root.geometry(f"{self.width}x{self.height}+{x}+{y}")
-
-    def _remember_position(self, x, y, screen):
-        self.settings.x, self.settings.y = x, y
-        self.settings.monitor = screen.name
-        self.settings.monitor_left, self.settings.monitor_top = screen.left, screen.top
-
-    def _drag_start(self, event):
-        self.drag_start = (event.x_root, event.y_root, self.root.winfo_x(), self.root.winfo_y())
-        self.dragged = False
-
-    def _drag_move(self, event):
-        if abs(event.x_root - self.drag_start[0]) + abs(event.y_root - self.drag_start[1]) < 5:
-            return
-        self.dragged = True
-        screen = screen_for_rect(event.x_root, event.y_root, 1, 1, self.screens)
-        x, y = clamp_position(self.drag_start[2] + event.x_root - self.drag_start[0],
-                              self.drag_start[3] + event.y_root - self.drag_start[1],
-                              self.width, self.height, screen)
-        self.root.geometry(f"+{x}+{y}")
-
-    def _drag_end(self, event):
-        if self.dragged:
-            self._remember_position(self.root.winfo_x(), self.root.winfo_y(),
-                                    screen_for_rect(self.root.winfo_x(), self.root.winfo_y(), self.width, self.height, self.screens))
-            self.on_save()
-            return
-        if self.panel.state() == "normal":
-            self.panel.withdraw()
-            return
-        self.show_panel()
-
-    def _panel_drag_start(self, event):
-        self.panel_drag = (event.x_root - self.panel.winfo_x(), event.y_root - self.panel.winfo_y())
-
-    def _panel_drag_move(self, event):
-        x, y = clamp_position(event.x_root - self.panel_drag[0], event.y_root - self.panel_drag[1],
-                              430, self.panel_height + 40,
-                              screen_for_rect(event.x_root, event.y_root, 1, 1, self.screens))
-        self.panel.geometry(f"+{x}+{y}")
-
-    def _context_menu(self, event):
-        self.menu.tk_popup(event.x_root, event.y_root)
-
-    def _scroll_tasks(self, event):
-        if self.current_tab == "tasks":
-            self.task_canvas.yview_scroll(-int(event.delta / 120), "units")
+        layout = self._page("tasks", "Codex 任务", "把进展放在眼前，安心做自己的事。")
+        toolbar = QHBoxLayout()
+        self.task_search = QLineEdit()
+        self.task_search.setPlaceholderText("搜索任务标题…")
+        self.task_search.textChanged.connect(self._filter_tasks)
+        toolbar.addWidget(self.task_search, 1)
+        self.task_filter = QComboBox()
+        for key, title in (("", "全部状态"), ("running", "执行中"), ("completed", "本轮完成"), ("failed", "失败"), ("interrupted", "已中断"), ("unknown", "状态未确认")):
+            self.task_filter.addItem(title, key)
+        self.task_filter.currentIndexChanged.connect(self._filter_tasks)
+        toolbar.addWidget(self.task_filter)
+        toolbar.addWidget(button("打开 Codex  ↗", lambda: self.open_codex_requested.emit(""), True))
+        layout.addLayout(toolbar)
+        self.task_status = label("正在读取本机任务…", "Muted", True)
+        layout.addWidget(self.task_status)
+        task_box, task_layout = card(margins=12)
+        self.task_list = QListWidget()
+        self.task_list.setWordWrap(True)
+        self.task_list.currentRowChanged.connect(self._task_selected)
+        self.task_list.itemDoubleClicked.connect(lambda item: self.open_codex_requested.emit(item.data(Qt.ItemDataRole.UserRole)))
+        task_layout.addWidget(self.task_list, 1)
+        self.task_empty = label("还没有任务记录\n在 Codex 中开始一次对话吧。", "Empty", True)
+        self.task_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        task_layout.addWidget(self.task_empty)
+        layout.addWidget(task_box, 1)
+        details, detail_layout = card("SoftCard", 18)
+        self.task_detail_title = label("选中任务查看详情", "SectionTitle", True)
+        self.task_detail_text = label("这里显示最新一轮的真实记录。本轮完成不代表整个项目已经完成。", "Muted", True)
+        detail_layout.addWidget(self.task_detail_title)
+        detail_layout.addWidget(self.task_detail_text)
+        detail_actions = QHBoxLayout()
+        detail_actions.addStretch()
+        self.task_open = button("打开原聊天  ↗", self._open_selected_task)
+        self.task_open.setEnabled(False)
+        detail_actions.addWidget(self.task_open)
+        detail_layout.addLayout(detail_actions)
+        layout.addWidget(details)
 
     def _build_pet(self):
-        canvas = self.canvas
-        self.items = {
-            "shadow": canvas.create_oval(59, 248, 201, 263, fill="#233A44", outline=""),
-            "shadow_inner": canvas.create_oval(76, 251, 184, 260, fill="#2C4D56", outline=""),
-            "sprite": canvas.create_image(130, 170, image=self.pet_image),
-            "spinner": canvas.create_arc(213, 86, 235, 108, extent=260, style="arc", width=3, tags="accent", state="hidden"),
-            "indicator": canvas.create_text(224, 97, font=("Segoe UI", 22, "bold"), tags="accent"),
-            "star_right": canvas.create_text(226, 117, text="✦", font=("Segoe UI", 22), tags="accent", state="hidden"),
-            "star_left": canvas.create_text(32, 127, text="✧", fill="#F8D48A", font=("Segoe UI", 15), state="hidden"),
-            "count_bg": canvas.create_oval(177, 201, 203, 227, outline=BG, width=2, tags="accent", state="hidden"),
-            "count": canvas.create_text(190, 214, fill=BG, font=("Segoe UI", 10, "bold")),
-            "bubble": canvas.create_polygon(20, 12, 240, 12, 240, 62, 141, 62, 130, 74, 119, 62, 20, 62,
-                                             fill=BG, outline="#3F5865", width=1, smooth=True, state="hidden"),
-            "message": canvas.create_text(130, 36, width=204, fill=TEXT, font=("Microsoft YaHei UI", 9), justify="center"),
-            "status": canvas.create_text(130, 279, text="◉  空闲", fill=MINT, font=("Microsoft YaHei UI", 9), tags="accent"),
-        }
-        self.draw_scale = self.scale
-        self.visual_signature = ()
-        canvas.scale("all", 0, 0, self.scale, self.scale)
+        layout = self._page("pet", "小新的陪伴空间", "让小新住在你喜欢的位置，陪你工作，也陪你放松。", True)
+        display, display_layout = card("Hero", 22)
+        self.pet_preview = QLabel()
+        self.pet_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pet_preview.setPixmap(self.pet_image.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        display_layout.addWidget(self.pet_preview)
+        caption = label("今天也要元气满满哦！", "SectionTitle")
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        display_layout.addWidget(caption)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(button("摸摸小新", lambda: self.pet_interact_requested.emit("pat")))
+        actions.addWidget(button("喂一份小零食", lambda: self.pet_interact_requested.emit("feed"), True))
+        actions.addStretch()
+        display_layout.addLayout(actions)
+        layout.addWidget(display)
+        preferences, pref_layout = card()
+        pref_layout.addWidget(label("桌面上的小新", "SectionTitle"))
+        toggles = QHBoxLayout()
+        self.pet_visible = QCheckBox("显示桌面宠物")
+        self.pet_visible.toggled.connect(self.pet_visibility_requested.emit)
+        toggles.addWidget(self.pet_visible)
+        self.pet_topmost = QCheckBox("让宠物保持置顶")
+        self.pet_topmost.toggled.connect(self.pet_topmost_requested.emit)
+        toggles.addWidget(self.pet_topmost)
+        toggles.addStretch()
+        pref_layout.addLayout(toggles)
+        size_row = QHBoxLayout()
+        size_row.addWidget(label("宠物大小", "Muted"))
+        self.pet_size = QSlider(Qt.Orientation.Horizontal)
+        self.pet_size.setRange(120, 320)
+        self.pet_size.setSingleStep(20)
+        self.pet_size.setPageStep(20)
+        self.pet_size.valueChanged.connect(self._pet_size_changed)
+        size_row.addWidget(self.pet_size, 1)
+        self.pet_size_value = label("200 px", "Muted")
+        size_row.addWidget(self.pet_size_value)
+        pref_layout.addLayout(size_row)
+        pref_layout.addWidget(button("找回宠物 · 回到主屏右下角", self.pet_restore_requested.emit))
+        pref_layout.addWidget(label("单击回应 · 双击打开助手 · 拖动换位置 · 右键更多操作", "Muted", True))
+        layout.addWidget(preferences)
+        layout.addStretch()
 
-    def _animate(self):
-        if not self.root.winfo_viewable():
-            self.animation_timer = self.root.after(500, self._animate)
+    def _build_focus(self):
+        layout = self._page("focus", "留一段时间，认真做一件事", "放慢一点也没关系。每一次专注，都值得被记录。", True)
+        timer_box, timer_layout = card()
+        modes = QHBoxLayout()
+        modes.addStretch()
+        self.focus_phase_buttons = {}
+        for phase, text in (("focus", "专注"), ("break", "休息")):
+            phase_button = button(text, lambda checked=False, value=phase: self.focus_action_requested.emit(value))
+            phase_button.setObjectName("Phase")
+            phase_button.setCheckable(True)
+            modes.addWidget(phase_button)
+            self.focus_phase_buttons[phase] = phase_button
+        modes.addStretch()
+        timer_layout.addLayout(modes)
+        self.focus_dial = FocusDial()
+        timer_layout.addWidget(self.focus_dial)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        self.focus_start = button("开始专注", lambda: self.focus_action_requested.emit("start"), True)
+        self.focus_pause = button("暂停", lambda: self.focus_action_requested.emit("pause"))
+        self.focus_reset = button("结束本次", lambda: self.focus_action_requested.emit("reset"))
+        controls.addWidget(self.focus_start)
+        controls.addWidget(self.focus_pause)
+        controls.addWidget(self.focus_reset)
+        controls.addStretch()
+        timer_layout.addLayout(controls)
+        timer_layout.addWidget(label("关闭主窗口后仍会计时；退出程序或电脑休眠时暂停。", "Muted", True))
+        layout.addWidget(timer_box)
+        duration_box, duration_layout = card(margins=18)
+        duration_row = QHBoxLayout()
+        duration_row.addWidget(label("专注", "Muted"))
+        self.focus_duration = QSpinBox()
+        self.focus_duration.setRange(1, 180)
+        self.focus_duration.setValue(self.settings.focus_minutes)
+        self.focus_duration.setSuffix(" 分钟")
+        duration_row.addWidget(self.focus_duration)
+        duration_row.addSpacing(14)
+        duration_row.addWidget(label("休息", "Muted"))
+        self.break_duration = QSpinBox()
+        self.break_duration.setRange(1, 60)
+        self.break_duration.setValue(self.settings.break_minutes)
+        self.break_duration.setSuffix(" 分钟")
+        duration_row.addWidget(self.break_duration)
+        duration_row.addStretch()
+        self.duration_apply = button("保存时长", lambda: self.focus_config_requested.emit(self.focus_duration.value(), self.break_duration.value()))
+        duration_row.addWidget(self.duration_apply)
+        duration_layout.addLayout(duration_row)
+        self.focus_stats = label("今日完成 0 次专注 · 累计 0 分钟", "SectionTitle")
+        duration_layout.addWidget(self.focus_stats)
+        duration_layout.addWidget(label("专注与休息都由你手动开始，只统计已完成的专注。", "Muted", True))
+        layout.addWidget(duration_box)
+        layout.addStretch()
+
+    def _build_settings(self):
+        layout = self._page("settings", "让 Orbit 更懂你的习惯", "连接 AI，安排陪伴方式。所有偏好都在这里。", True)
+        ai_box, ai_layout = card()
+        ai_heading = QHBoxLayout()
+        ai_heading.addWidget(label("AI 连接", "SectionTitle"))
+        ai_heading.addStretch()
+        self.ai_status = label("尚未配置", "Chip")
+        ai_heading.addWidget(self.ai_status)
+        ai_layout.addLayout(ai_heading)
+        ai_layout.addWidget(label("OpenAI API Key", "Muted"))
+        key_row = QHBoxLayout()
+        self.api_key = QLineEdit()
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.api_key.setPlaceholderText("填写 API Key，仅本次运行使用")
+        self.api_key.setText(self.settings.api_key)
+        key_row.addWidget(self.api_key, 1)
+        self.key_reveal = button("显示", self._toggle_key)
+        key_row.addWidget(self.key_reveal)
+        ai_layout.addLayout(key_row)
+        ai_layout.addWidget(label("模型名称", "Muted"))
+        self.model_name = QLineEdit()
+        self.model_name.setPlaceholderText("填写你的账户可用模型")
+        self.model_name.setText(self.settings.model)
+        ai_layout.addWidget(self.model_name)
+        ai_layout.addWidget(label("也可通过 OPENAI_API_KEY / OPENAI_MODEL 环境变量配置。API Key 不写入本地文件。", "Muted", True))
+        layout.addWidget(ai_box)
+        preferences, pref_layout = card()
+        pref_layout.addWidget(label("陪伴偏好", "SectionTitle"))
+        self.quiet = QCheckBox("免打扰 · 保留动态记录，关闭任务与计时弹出提示")
+        self.quiet.setChecked(self.settings.quiet)
+        pref_layout.addWidget(self.quiet)
+        self.startup_pet = QCheckBox("显示桌面宠物，下次启动也保持此选择")
+        self.startup_pet.setChecked(self.settings.pet_visible)
+        pref_layout.addWidget(self.startup_pet)
+        pref_layout.addWidget(button("保存设置", lambda: self.settings_save_requested.emit(self.api_key.text().strip(), self.model_name.text().strip(), self.quiet.isChecked(), self.startup_pet.isChecked()), True))
+        layout.addWidget(preferences)
+        about, about_layout = card("SoftCard", 18)
+        about_layout.addWidget(label("Orbit 2.1 · 小新桌面助手", "SectionTitle"))
+        about_layout.addWidget(label("历史会话、专注记录和偏好保存在本机。", "Muted", True))
+        path_label = label(str(self.data_dir), "Muted", True)
+        path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        about_layout.addWidget(path_label)
+        about_actions = QHBoxLayout()
+        about_actions.addWidget(button("打开数据目录", lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.data_dir)))))
+        about_actions.addStretch()
+        quit_button = button("退出 Orbit", self.quit_requested.emit)
+        quit_button.setObjectName("Danger")
+        about_actions.addWidget(quit_button)
+        about_layout.addLayout(about_actions)
+        layout.addWidget(about)
+        layout.addStretch()
+
+    def _select_page(self, name):
+        self.current_page = name
+        self.stack.setCurrentIndex(self.pages[name])
+        for page, nav in self.nav_buttons.items():
+            nav.setChecked(page == name)
+        if name == 'usage':
+            self.usage_requested.emit(*self.usage_page.current_query())
+
+    def set_usage(self, report):
+        self.usage_page.set_report(report)
+
+    def set_usage_status(self, text):
+        self.usage_page.set_status(text)
+
+    def show_page(self, name):
+        self._select_page(name)
+        self.activate()
+
+    def activate(self):
+        if self.isMinimized():
+            self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        if self.settings.main_maximized and not self.isVisible():
+            self.showMaximized()
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _send(self):
+        if self.busy or not self.chat_input.toPlainText().strip():
             return
-        self.frame += 1
-        elapsed = monotonic() - self.state_started
-        active = sum(task.state in ("running", "waiting") for task in self.tasks)
-        if (self.state, self.message, active, self.scale) != self.visual_signature:
-            self.visual_signature = (self.state, self.message, active, self.scale)
-            self.canvas.scale("all", 0, 0, self.scale / self.draw_scale, self.scale / self.draw_scale)
-            self.draw_scale = self.scale
-            self.canvas.itemconfigure("accent", fill=COLORS[self.state])
-            self.canvas.itemconfigure(self.items["spinner"], outline=COLORS[self.state],
-                                      state="normal" if self.state == "running" else "hidden")
-            self.canvas.itemconfigure(self.items["indicator"], text={
-                "thinking": "···", "waiting": "!", "failed": "×", "interrupted": "Ⅱ",
-                "unknown": "?", "offline": "·"}.get(self.state, ""))
-            for name in ("star_left", "star_right"):
-                self.canvas.itemconfigure(self.items[name], state="normal" if self.state == "completed" else "hidden")
-            for name in ("count_bg", "count"):
-                self.canvas.itemconfigure(self.items[name], state="normal" if active else "hidden")
-            self.canvas.itemconfigure(self.items["count"], text=str(active))
-            for name in ("bubble", "message"):
-                self.canvas.itemconfigure(self.items[name], state="normal" if self.message else "hidden")
-            self.canvas.itemconfigure(self.items["message"], text=self.message, width=204 * self.scale)
-            self.canvas.itemconfigure(self.items["status"], text="◉  " + STATE_LABELS[self.state])
-            self.canvas.itemconfigure(self.items["sprite"], image=self.pet_image)
-        sway = 4 * math.sin(elapsed * 2) if self.state == "thinking" else 0
-        if self.state == "failed":
-            sway = 6 * math.sin(elapsed * 24) * max(0, 1 - elapsed / 1.2)
-        bob = math.sin(elapsed * 1.5) * 1.5
-        if self.state == "running":
-            bob = -3 * abs(math.sin(elapsed * 8))
-            self.canvas.itemconfigure(self.items["spinner"], start=(elapsed * 180) % 360)
-        if self.state == "completed":
-            bob = -12 * max(0, math.sin(elapsed * 6)) if elapsed < 2.4 else 0
-        self.canvas.coords(self.items["sprite"], (130 + sway) * self.scale, (170 + bob) * self.scale)
-        self.canvas.coords(self.items["star_left"], 32 * self.scale, (127 - bob) * self.scale)
-        self.canvas.coords(self.items["star_right"], 226 * self.scale, (117 + bob) * self.scale)
-        self.animation_timer = self.root.after(
-            80 if self.state in ("running", "thinking", "completed", "failed") else 250, self._animate)
+        self.send_requested.emit(self.chat_input.toPlainText().strip(), self.include_tasks.isChecked())
+
+    def _conversation_selected(self, current, previous):
+        if current:
+            self.scroll_positions[self.selected_id] = self.message_scroll.verticalScrollBar().value()
+            self.select_chat_requested.emit(current.data(Qt.ItemDataRole.UserRole))
+
+    def _rename_chat(self):
+        if not self.selected_id:
+            return
+        title, accepted = QInputDialog.getText(self, "重命名对话", "对话名称", text=self.conversation_titles[self.selected_id])
+        if accepted and title.strip():
+            self.rename_chat_requested.emit(self.selected_id, title.strip())
+
+    def _delete_chat(self):
+        if not self.selected_id:
+            return
+        if QMessageBox.question(self, "删除对话", "删除这段对话及其本地消息？", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            self.delete_chat_requested.emit(self.selected_id)
+
+    def set_conversations(self, conversations, selected_id):
+        changed = self.selected_id != selected_id
+        self.selected_id = selected_id
+        self.conversation_titles = {item.id: item.title for item in conversations}
+        with QSignalBlocker(self.conversation_list):
+            self.conversation_list.clear()
+            for conversation in conversations:
+                item = QListWidgetItem(conversation.title)
+                item.setToolTip(conversation.title + "\n" + conversation.updated_at)
+                item.setData(Qt.ItemDataRole.UserRole, conversation.id)
+                self.conversation_list.addItem(item)
+                if conversation.id == selected_id:
+                    self.conversation_list.setCurrentItem(item)
+        self.chat_title.setText(self.conversation_titles.get(selected_id, "新的故事，从这里开始"))
+        self.rename_button.setEnabled(bool(selected_id))
+        self.delete_button.setEnabled(bool(selected_id) and not self.busy)
+        if changed:
+            clear_layout(self.message_layout)
+            self.message_cards.clear()
+
+    def set_messages(self, messages):
+        scrollbar = self.message_scroll.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 30
+        position = self.scroll_positions.get(self.selected_id) if self.message_conversation != self.selected_id else (None if at_bottom else scrollbar.value())
+        self.message_conversation = self.selected_id
+        ids = [message.id for message in messages]
+        fresh = list(self.message_cards) != ids
+        if fresh or not messages:
+            clear_layout(self.message_layout)
+            self.message_cards.clear()
+            for message in messages:
+                message_card = MessageCard(message)
+                self.message_cards[message.id] = message_card
+                self.message_layout.addWidget(message_card)
+            if not messages:
+                empty = label("嗨，我是小新。\n\n想聊什么都可以，从一句“你好”开始吧。\n首次聊天，请先在设置中连接 AI。", "Empty", True)
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.message_layout.addWidget(empty)
+        if not fresh:
+            for message in messages:
+                self.message_cards[message.id].update_message(message.content, message.status)
+        conversation_id = self.selected_id
+        QTimer.singleShot(0, lambda: self._scroll_to(conversation_id, position))
+
+    def _scroll_to(self, conversation_id, position):
+        if conversation_id != self.selected_id:
+            return
+        scrollbar = self.message_scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum() if position is None else position)
+
+    def append_reply(self, message_id, text):
+        if message_id not in self.message_cards:
+            return
+        scrollbar = self.message_scroll.verticalScrollBar()
+        at_bottom = scrollbar.value() >= scrollbar.maximum() - 30
+        message = self.message_cards[message_id]
+        message.update_message(message.content + text, "streaming")
+        if at_bottom:
+            conversation_id = self.selected_id
+            QTimer.singleShot(0, lambda: self._scroll_to(conversation_id, None))
+
+    def set_busy(self, busy):
+        self.busy = busy
+        self.chat_input.setEnabled(not busy)
+        self.send_button.setEnabled(not busy)
+        self.send_button.setText("回复中…" if busy else "发送  ↑")
+        self.delete_button.setEnabled(bool(self.selected_id) and not busy)
+        if busy:
+            self.chat_input.clear()
+        self.chat_hint.setText("小新正在回复。你可以切换页面，回复会保存在原对话。" if busy else "Enter 发送 · Shift+Enter 换行 · 会话仅保存在本机")
+
+    def set_tasks(self, tasks, status):
+        self.tasks = tasks
+        self.task_status.setText(status)
+        self.statusBar().showMessage("Codex · " + status)
+        self.home_monitor.setText("监测范围：最近 20 个未归档主聊天 · " + ("未连接" if status.startswith(("未连接", "读取任务失败")) else f"当前读取 {len(tasks)} 个"))
+        self.stat_values["running"].setText(str(sum(task.state == "running" for task in tasks)))
+        self.stat_values["completed"].setText(str(sum(task.state == "completed" for task in tasks)))
+        self._filter_tasks()
+
+    def _filter_tasks(self):
+        selected = self.task_list.currentItem().data(Qt.ItemDataRole.UserRole) if self.task_list.currentItem() else ""
+        with QSignalBlocker(self.task_list):
+            self.task_list.clear()
+            for task in self.tasks:
+                if self.task_search.text().casefold() not in task.title.casefold() or (self.task_filter.currentData() and task.state != self.task_filter.currentData()):
+                    continue
+                item = QListWidgetItem(f"{task.title}\n{STATE_LABELS[task.state]}   ·   {task.updated_at}")
+                item.setData(Qt.ItemDataRole.UserRole, task.id)
+                item.setToolTip(task.detail)
+                self.task_list.addItem(item)
+                if task.id == selected:
+                    self.task_list.setCurrentItem(item)
+            if self.task_list.count() and self.task_list.currentRow() < 0:
+                self.task_list.setCurrentRow(0)
+        self.task_empty.setVisible(self.task_list.count() == 0)
+        self.task_empty.setText("没有匹配的任务\n试试其他关键词或状态。" if self.tasks else "还没有任务记录\n在 Codex 中开始一次对话吧。")
+        self._task_selected()
+
+    def _task_selected(self):
+        current = self.task_list.currentItem()
+        self.task_open.setEnabled(current is not None)
+        if current is None:
+            self.task_detail_title.setText("选中任务查看详情")
+            self.task_detail_text.setText("这里显示最新一轮的真实记录。本轮完成不代表整个项目已经完成。")
+            return
+        task = next(task for task in self.tasks if task.id == current.data(Qt.ItemDataRole.UserRole))
+        self.task_detail_title.setText(task.title)
+        self.task_detail_text.setText(f"{STATE_LABELS[task.state]} · {task.updated_at}\n{task.detail}")
+
+    def _open_selected_task(self):
+        self.open_codex_requested.emit(self.task_list.currentItem().data(Qt.ItemDataRole.UserRole))
+
+    def set_activity(self, activities):
+        clear_layout(self.home_activity)
+        if not activities:
+            self.home_activity.addWidget(label("这里会记录任务进展与专注时刻。", "Muted", True))
+            return
+        for activity in activities[:5]:
+            entry = label("●  " + activity.text, wrap=True)
+            entry.setToolTip(activity.created_at)
+            self.home_activity.addWidget(entry)
+
+    def _pet_size_changed(self, value):
+        self.pet_size_value.setText(f"{value} px")
+        self.pet_size_requested.emit(value)
+
+    def set_focus(self, phase, state, remaining, stats):
+        seconds = max(0, math.ceil(remaining))
+        self.home_timer.setText(f"{seconds // 60:02}:{seconds % 60:02}")
+        self.stat_values["focus"].setText(str(stats[1] // 60))
+        self.focus_stats.setText(f"今日完成 {stats[0]} 次专注 · 累计 {stats[1] // 60} 分钟")
+        self.focus_dial.remaining = remaining
+        self.focus_dial.total = (self.settings.focus_minutes if phase == "focus" else self.settings.break_minutes) * 60
+        self.focus_dial.caption = {"idle": "准备好，随时可以开始", "running": "小新陪你" + ("专注中" if phase == "focus" else "休息中"), "paused": "已暂停，慢慢来"}[state]
+        if state == "idle" and remaining == 0:
+            self.focus_dial.caption = "完成啦，给自己一个微笑"
+        self.focus_dial.update()
+        self.focus_start.setText("继续" if state == "paused" else ("开始专注" if phase == "focus" else "开始休息"))
+        self.focus_start.setEnabled(state != "running")
+        self.focus_pause.setEnabled(state == "running")
+        self.focus_reset.setEnabled(state != "idle")
+        for key, phase_button in self.focus_phase_buttons.items():
+            phase_button.setChecked(key == phase)
+            phase_button.setEnabled(state == "idle")
+        for control in (self.focus_duration, self.break_duration, self.duration_apply):
+            control.setEnabled(state == "idle")
+
+    def sync_settings(self):
+        for control, value in ((self.pet_visible, self.settings.pet_visible), (self.pet_topmost, self.settings.topmost)):
+            with QSignalBlocker(control):
+                control.setChecked(value)
+        with QSignalBlocker(self.pet_size):
+            self.pet_size.setValue(self.settings.pet_size)
+        self.pet_size_value.setText(f"{self.settings.pet_size} px")
+        values = (self.settings.api_key, self.settings.model, self.settings.focus_minutes,
+                  self.settings.break_minutes, self.settings.quiet, self.settings.pet_visible)
+        if values[0] != self.form_snapshot[0]:
+            self.api_key.setText(self.settings.api_key)
+        if values[1] != self.form_snapshot[1]:
+            self.model_name.setText(self.settings.model)
+        if values[2] != self.form_snapshot[2]:
+            self.focus_duration.setValue(self.settings.focus_minutes)
+        if values[3] != self.form_snapshot[3]:
+            self.break_duration.setValue(self.settings.break_minutes)
+        if values[4] != self.form_snapshot[4]:
+            self.quiet.setChecked(self.settings.quiet)
+        if values[5] != self.form_snapshot[5]:
+            self.startup_pet.setChecked(self.settings.pet_visible)
+        self.form_snapshot = values
+        self.ai_status.setText("已填写 · 待请求验证" if self.settings.api_key and self.settings.model else "尚未配置")
+
+    def _toggle_key(self):
+        reveal = self.api_key.echoMode() == QLineEdit.EchoMode.Password
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Normal if reveal else QLineEdit.EchoMode.Password)
+        self.key_reveal.setText("隐藏" if reveal else "显示")
+
+    def show_error(self, text):
+        QMessageBox.warning(self, "Orbit 提示", text)
+
+    def show_notice(self, text):
+        self.statusBar().showMessage(text, 8000)
+
+    def remember_geometry(self):
+        if not self.geometry_ready or self.isMinimized():
+            return
+        self.settings.main_geometry = bytes(self.saveGeometry().toHex()).decode()
+        self.settings.main_maximized = self.isMaximized()
+
+    def closeEvent(self, event):
+        self.remember_geometry()
+        event.ignore()
+        self.hide()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.sidebar.setFixedWidth(175 if self.width() < 950 else 210)
+        for nav in self.nav_buttons.values():
+            nav.setStyleSheet("padding: 6px 12px;" if self.height() < 680 else "")
+        self.side_note.setVisible(self.height() >= 740)
+        self.side_footer.setVisible(self.height() >= 680)
+        self.home_pet.setVisible(self.width() >= 850)
+        self.remember_geometry()
+
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        self.remember_geometry()
