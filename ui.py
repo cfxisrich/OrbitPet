@@ -2,9 +2,9 @@ import math
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QRectF, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPen, QPixmap, QTextDocument
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog,
+    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
     QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
@@ -170,7 +170,9 @@ class MainWindow(QMainWindow):
     pet_interact_requested = Signal(str)
     focus_action_requested = Signal(str)
     focus_config_requested = Signal(int, int)
-    settings_save_requested = Signal(str, str, bool, bool)
+    settings_save_requested = Signal(str, str, bool, bool, bool)
+    autostart_refresh_requested = Signal()
+    restore_shortcut_requested = Signal(str)
     quit_requested = Signal()
     usage_requested = Signal(str, str, str)
     usage_refresh_requested = Signal()
@@ -241,7 +243,7 @@ class MainWindow(QMainWindow):
         note_layout.addWidget(label("陪你聊天，也陪你等代码完成。", "Muted", True))
         side_layout.addWidget(self.side_note)
         side_layout.addSpacing(4)
-        self.side_footer = label("ORBIT 2.1  /  MADE FOR YOUR DAY", "Muted", True)
+        self.side_footer = label("ORBIT 2.2  /  MADE FOR YOUR DAY", "Muted", True)
         side_layout.addWidget(self.side_footer)
         shell_layout.addWidget(self.sidebar)
         shell_layout.addWidget(self.stack, 1)
@@ -576,10 +578,30 @@ class MainWindow(QMainWindow):
         self.startup_pet = QCheckBox("显示桌面宠物，下次启动也保持此选择")
         self.startup_pet.setChecked(self.settings.pet_visible)
         pref_layout.addWidget(self.startup_pet)
-        pref_layout.addWidget(button("保存设置", lambda: self.settings_save_requested.emit(self.api_key.text().strip(), self.model_name.text().strip(), self.quiet.isChecked(), self.startup_pet.isChecked()), True))
+        self.autostart = QCheckBox("登录 Windows 时自动启动 Orbit")
+        pref_layout.addWidget(self.autostart)
+        pref_layout.addWidget(button("保存设置", lambda: self.settings_save_requested.emit(
+            self.api_key.text().strip(), self.model_name.text().strip(), self.quiet.isChecked(),
+            self.startup_pet.isChecked(), self.autostart.isChecked()), True))
         layout.addWidget(preferences)
+        shortcut_box, shortcut_layout = card()
+        shortcut_layout.addWidget(label("找回小新的全局快捷键", "SectionTitle"))
+        shortcut_layout.addWidget(label("点击输入框并按下组合键。清空后点击应用即可关闭快捷键。", "Muted", True))
+        shortcut_row = QHBoxLayout()
+        self.restore_shortcut_edit = QKeySequenceEdit()
+        self.restore_shortcut_edit.setAccessibleName("找回小新的全局快捷键")
+        self.restore_shortcut_edit.setMaximumSequenceLength(1)
+        self.restore_shortcut_edit.setClearButtonEnabled(True)
+        shortcut_row.addWidget(self.restore_shortcut_edit, 1)
+        shortcut_row.addWidget(button("应用快捷键", lambda: self.restore_shortcut_requested.emit(
+            self.restore_shortcut_edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText))))
+        shortcut_layout.addLayout(shortcut_row)
+        self.shortcut_status = label("", "Muted", True)
+        shortcut_layout.addWidget(self.shortcut_status)
+        self.set_restore_shortcut(self.settings.restore_shortcut)
+        layout.addWidget(shortcut_box)
         about, about_layout = card("SoftCard", 18)
-        about_layout.addWidget(label("Orbit 2.1 · 小新桌面助手", "SectionTitle"))
+        about_layout.addWidget(label("Orbit 2.2 · 小新桌面助手", "SectionTitle"))
         about_layout.addWidget(label("历史会话、专注记录和偏好保存在本机。", "Muted", True))
         path_label = label(str(self.data_dir), "Muted", True)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -601,9 +623,15 @@ class MainWindow(QMainWindow):
             nav.setChecked(page == name)
         if name == 'usage':
             self.usage_requested.emit(*self.usage_page.current_query())
+        if name == 'settings':
+            self.autostart_refresh_requested.emit()
 
     def set_usage(self, report):
         self.usage_page.set_report(report)
+
+    def set_restore_shortcut(self, sequence: str, message=""):
+        self.restore_shortcut_edit.setKeySequence(QKeySequence.fromString(sequence, QKeySequence.SequenceFormat.PortableText))
+        self.shortcut_status.setText(message or (f"当前快捷键：{sequence}" if sequence else "快捷键已关闭"))
 
     def set_usage_status(self, text):
         self.usage_page.set_status(text)

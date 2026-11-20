@@ -4,32 +4,34 @@ import sys
 import threading
 from contextlib import closing
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
-from PySide6.QtGui import QIcon
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtCore import QDate, QObject, QRect, QSignalBlocker, QTimer, Signal, Slot
+from PySide6.QtGui import QCursor, QIcon
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox
 
 from ai_client import AiError, stream_reply
 from codex_monitor import CodexMonitor
 from codex_usage import CodexUsageImporter
 from configuration import load_settings, save_settings
 from focus import FocusTimer
+from hotkey import RestoreHotkey
 from models import Task, STATE_LABELS
 from pet_window import PetWindow
+from quick_panel import QuickPanel
 from storage import Storage
 from tray import TrayIcon
 from ui import MainWindow
-from usage_store import UsageRecord, UsageStore
-from windows import SingleInstance
+from usage_store import LOCAL_TIME, UsageRecord, UsageStore
+from windows import SingleInstance, autostart_enabled, set_autostart
 
 
 BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 DATA = BASE / 'data'
 CONFIG = DATA / 'settings.json'
-VERSION = '2.1.0'
+VERSION = '2.2.0'
 
 
 class Events(QObject):
@@ -42,7 +44,7 @@ class Events(QObject):
 
 
 class Companion(QObject):
-    def __init__(self, settings, instance: SingleInstance, data_dir=DATA):
+    def __init__(self, settings, instance: SingleInstance, data_dir=DATA, *, autostart=False):
         super().__init__()
         self.settings = settings
         self.instance = instance
@@ -65,6 +67,12 @@ class Companion(QObject):
         self.selected_id = ''
         self.window = MainWindow(settings, data_dir)
         self.pet = PetWindow(settings)
+        self.panel = QuickPanel()
+        self.hotkey = RestoreHotkey(self.pet.restore_on_cursor_screen)
+        try:
+            self.hotkey.set_shortcut(settings.restore_shortcut)
+        except (OSError, ValueError) as error:
+            self.window.set_restore_shortcut(settings.restore_shortcut, '当前快捷键未启用：' + str(error))
         self.focus = FocusTimer(self)
         self.focus.configure(settings.focus_minutes, settings.break_minutes)
         self.focus.restore(self.storage.get_focus())
@@ -76,7 +84,8 @@ class Companion(QObject):
         self.refresh_activity()
         self.focus_changed()
         self.pet.set_state('offline')
-        self.window.show_page('home')
+        if not autostart:
+            self.window.show_page('home')
         self.tray.show()
         self.ticker = QTimer(self)
         self.ticker.setInterval(100)
@@ -108,13 +117,20 @@ class Companion(QObject):
         self.window.focus_action_requested.connect(self.focus_action)
         self.window.focus_config_requested.connect(self.configure_focus)
         self.window.settings_save_requested.connect(self.save_preferences)
+        self.window.autostart_refresh_requested.connect(self.refresh_autostart)
+        self.window.restore_shortcut_requested.connect(self.apply_shortcut)
         self.window.quit_requested.connect(self.quit)
         self.window.usage_requested.connect(self.refresh_usage)
         self.window.usage_refresh_requested.connect(self.scan_usage)
         self.pet.open_page.connect(self.window.show_page)
+        self.pet.panel_requested.connect(lambda: self.show_panel(self.pet.frameGeometry()))
+        self.pet.notice_requested.connect(self.open_notice)
         self.pet.settings_changed.connect(self.pet_changed)
         self.pet.quit_requested.connect(self.quit)
         self.tray.open_page.connect(self.window.show_page)
+        self.tray.panel_requested.connect(lambda: self.show_panel(self.tray.geometry()))
+        self.tray.notice_requested.connect(self.open_notice)
+        self.panel.open_page.connect(self.open_panel_page)
         self.tray.restore_pet.connect(self.pet.restore_pet)
         self.tray.quit_requested.connect(self.quit)
         self.events.tasks.connect(self.update_tasks)
@@ -126,16 +142,68 @@ class Companion(QObject):
         self.focus.changed.connect(self.focus_changed)
         self.focus.completed.connect(self.focus_completed)
 
-    def save(self):
+    def save(self) -> bool:
         try:
             save_settings(self.config, self.settings)
         except OSError as error:
             self.window.show_error('无法保存设置：' + str(error))
+            return False
+        return True
 
     @Slot()
     def pet_changed(self):
         self.window.sync_settings()
         self.save()
+
+    @Slot(str)
+    def apply_shortcut(self, sequence):
+        try:
+            self.hotkey.set_shortcut(sequence)
+        except (OSError, ValueError) as error:
+            self.window.set_restore_shortcut(self.settings.restore_shortcut, str(error))
+            return
+        self.settings.restore_shortcut = sequence
+        if self.save():
+            self.window.set_restore_shortcut(sequence, '已启用' if sequence else '已关闭')
+
+    def show_panel(self, anchor):
+        if not anchor.isValid():
+            anchor = QRect(QCursor.pos(), QCursor.pos())
+        self.refresh_panel_tokens()
+        self.panel.show_at(anchor, QApplication.screenAt(anchor.center()) or QApplication.primaryScreen())
+
+    def refresh_panel_tokens(self):
+        today = datetime.now(LOCAL_TIME).date()
+        self.panel.set_tokens(self.usage_store.report('day', 'all', today).totals.total_tokens)
+
+    @Slot(str)
+    def open_panel_page(self, page):
+        if page == 'usage':
+            usage = self.window.usage_page
+            with QSignalBlocker(usage):
+                usage.period.setCurrentIndex(usage.period.findData('day'))
+                usage.source.setCurrentIndex(usage.source.findData('all'))
+                usage.anchor.setDate(QDate(datetime.now(LOCAL_TIME).date()))
+        if page == 'tasks':
+            self.window.task_search.clear()
+            self.window.task_filter.setCurrentIndex(self.window.task_filter.findData('running'))
+        self.window.show_page(page)
+
+    @Slot(list)
+    def open_notice(self, tasks):
+        if len(tasks) == 1:
+            self.open_codex(tasks[0].id)
+            return
+        menu = QMenu(self.window)
+        menu.setTitle('选择要打开的 Codex 聊天')
+        menu.addSection(menu.title())
+        for task in tasks:
+            title = task.title.replace('&', '&&')
+            action = menu.addAction(f'{title} · {STATE_LABELS[task.state]}')
+            action.setData(task.id)
+        menu.triggered.connect(lambda action: self.open_codex(action.data()))
+        menu.aboutToHide.connect(menu.deleteLater)
+        menu.popup(QCursor.pos())
 
     @Slot(int)
     def set_pet_size(self, size):
@@ -149,15 +217,33 @@ class Companion(QObject):
         self.pet.apply_settings()
         self.pet_changed()
 
-    @Slot(str, str, bool, bool)
-    def save_preferences(self, api_key, model, quiet, pet_visible):
+    @Slot()
+    def refresh_autostart(self):
+        try:
+            self.window.autostart.setChecked(autostart_enabled())
+        except OSError as error:
+            self.window.autostart.setEnabled(False)
+            self.window.show_notice('无法读取 Windows 登录启动项：' + str(error))
+            return
+        self.window.autostart.setEnabled(True)
+
+    @Slot(str, str, bool, bool, bool)
+    def save_preferences(self, api_key, model, quiet, pet_visible, autostart):
+        if self.window.autostart.isEnabled():
+            try:
+                set_autostart(autostart)
+            except OSError as error:
+                self.refresh_autostart()
+                self.window.show_error('无法保存 Windows 登录启动项：' + str(error))
+                return
         self.settings.api_key = api_key.strip()
         self.settings.model = model.strip()
         self.settings.quiet = quiet
-        self.pet.set_visible(pet_visible)
+        with QSignalBlocker(self.pet):
+            self.pet.set_visible(pet_visible)
         self.window.sync_settings()
-        self.save()
-        self.window.show_notice('设置已保存，API Key 仅在本次运行使用。')
+        if self.save():
+            self.window.show_notice('设置已保存，API Key 仅在本次运行使用。')
 
     @Slot(str)
     def open_codex(self, thread_id):
@@ -199,7 +285,9 @@ class Companion(QObject):
                 task.title + ' · ' + STATE_LABELS[task.state], 'task',
                 'task:' + task.id + ':' + task.turn_id + ':' + task.state)]
             if notices:
-                self.notify(notices[0].title[:32] + ' · ' + STATE_LABELS[notices[0].state], notices[0].state)
+                text = (notices[0].title[:32] + ' · ' + STATE_LABELS[notices[0].state] if len(notices) == 1
+                        else f'{len(notices)} 个 Codex 任务有结果，点击选择聊天')
+                self.notify(text, notices[0].state, notices)
                 self.refresh_activity()
         if self.monitor_ok:
             self.initialized = True
@@ -215,17 +303,18 @@ class Companion(QObject):
         self.refresh_pet()
 
     def refresh_pet(self):
+        self.panel.set_tasks(sum(task.state == 'running' for task in self.tasks) if self.monitor_ok else None)
         self.pet.set_state('thinking' if self.active_message else
                            'running' if any(task.state == 'running' for task in self.tasks) else
                            'idle' if self.monitor_ok else 'offline')
 
-    def notify(self, text, state='completed'):
+    def notify(self, text, state='completed', tasks=()):
         if self.settings.quiet:
             return
         if self.settings.pet_visible:
-            self.pet.notify(text, state)
+            self.pet.notify(text, state, tasks)
             return
-        self.tray.notify(text)
+        self.tray.notify(text, tasks)
 
     def refresh_activity(self):
         self.window.set_activity(self.storage.activities())
@@ -344,6 +433,8 @@ class Companion(QObject):
     @Slot(str, str, str)
     def refresh_usage(self, period, source, anchor):
         self.window.set_usage(self.usage_store.report(period, source, date.fromisoformat(anchor)))
+        if self.panel.isVisible():
+            self.refresh_panel_tokens()
 
     @Slot()
     def scan_usage(self):
@@ -396,6 +487,7 @@ class Companion(QObject):
     def focus_changed(self):
         if self.closing:
             return
+        self.panel.set_focus(self.focus.phase, self.focus.state, self.focus.remaining)
         self.window.set_focus(self.focus.phase, self.focus.state, self.focus.remaining, self.storage.focus_stats())
         if self.focus_state != self.focus.state:
             self.focus_state = self.focus.state
@@ -432,6 +524,8 @@ class Companion(QObject):
         self.ticker.stop()
         self.checkpoint.stop()
         self.usage_timer.stop()
+        self.hotkey.close()
+        self.panel.hide()
         self.tray.hide()
         self.pet.hide()
         self.window.hide()
@@ -441,6 +535,7 @@ class Companion(QObject):
 
 
 def main():
+    autostart = '--autostart' in sys.argv[1:]
     application = QApplication(sys.argv)
     application.setApplicationName('Orbit')
     application.setApplicationVersion(VERSION)
@@ -448,12 +543,13 @@ def main():
     application.setWindowIcon(QIcon(str(Path(__file__).parent / 'assets/orbit.ico')))
     instance = SingleInstance()
     if not instance.primary:
-        instance.wake()
+        if not autostart:
+            instance.wake()
         instance.close()
         return 0
     try:
         try:
-            companion = Companion(load_settings(CONFIG, application.screens()), instance)
+            companion = Companion(load_settings(CONFIG, application.screens()), instance, autostart=autostart)
         except (OSError, ValueError, sqlite3.Error) as error:
             QMessageBox.critical(None, 'Orbit 启动失败', str(error))
             return 1

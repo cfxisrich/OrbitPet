@@ -7,9 +7,9 @@ os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFontDatabase, QInputMethodEvent
+from PySide6.QtGui import QFontDatabase, QInputMethodEvent, QKeySequence
 from PySide6.QtTest import QSignalSpy, QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QPushButton
 
 from models import Activity, Conversation, Message, Settings, Task
 from ui import MainWindow
@@ -123,6 +123,34 @@ class MainWindowTests(unittest.TestCase):
         application.processEvents()
         self.assertTrue(self.window.isMaximized())
         self.assertFalse(self.window.isMinimized())
+
+    def test_settings_refresh_and_save_autostart_independently_of_pet(self):
+        refresh = QSignalSpy(self.window.autostart_refresh_requested)
+        saved = QSignalSpy(self.window.settings_save_requested)
+        self.window.nav_buttons['settings'].click()
+        self.assertEqual(refresh.count(), 1)
+        save_button = next(b for b in self.window.findChildren(QPushButton) if b.text() == '保存设置')
+        for pet_visible, autostart in ((False, True), (True, False)):
+            self.window.startup_pet.setChecked(pet_visible)
+            self.window.autostart.setChecked(autostart)
+            save_button.click()
+            self.assertEqual(saved.at(saved.count() - 1)[3:], [pet_visible, autostart])
+        self.window.show_page('home')
+        self.window.show_page('settings')
+        self.assertEqual(refresh.count(), 2)
+
+    def test_restore_shortcut_can_change_and_clear_independently(self):
+        self.window.show_page('settings')
+        shortcuts = QSignalSpy(self.window.restore_shortcut_requested)
+        settings = QSignalSpy(self.window.settings_save_requested)
+        apply = next(b for b in self.window.findChildren(QPushButton) if b.text() == '应用快捷键')
+        self.assertEqual(self.window.restore_shortcut_edit.keySequence().toString(), 'Ctrl+Alt+P')
+        self.window.restore_shortcut_edit.setKeySequence(QKeySequence('Ctrl+Alt+K'))
+        apply.click()
+        self.window.restore_shortcut_edit.clear()
+        apply.click()
+        self.assertEqual([shortcuts.at(i) for i in range(shortcuts.count())], [['Ctrl+Alt+K'], ['']])
+        self.assertEqual(settings.count(), 0)
 
 
 if __name__ == '__main__':

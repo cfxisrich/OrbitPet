@@ -5,7 +5,7 @@ from pathlib import Path
 from time import monotonic
 
 from PySide6.QtCore import QPoint, QRectF, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QMouseEvent, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from models import Settings, STATE_LABELS
@@ -33,6 +33,8 @@ STATE_COLORS = {
 
 class PetWindow(QWidget):
     open_page = Signal(str)
+    panel_requested = Signal()
+    notice_requested = Signal(list)
     settings_changed = Signal()
     quit_requested = Signal()
 
@@ -52,6 +54,8 @@ class PetWindow(QWidget):
         self.notice_state = "idle"
         self.notice = ""
         self.notice_until = 0.0
+        self.notice_tasks = ()
+        self.pressed_tasks = ()
         self.effect = ""
         self.started = monotonic()
         self.drag_origin = QPoint()
@@ -60,7 +64,7 @@ class PetWindow(QWidget):
         self.double_clicked = False
         self.single_click = QTimer(self)
         self.single_click.setSingleShot(True)
-        self.single_click.timeout.connect(lambda: self.notify("嘿嘿，今天也一起加油呀！"))
+        self.single_click.timeout.connect(self.panel_requested.emit)
         self.animation = QTimer(self)
         self.animation.timeout.connect(self._animate)
         self.animation.start(250)
@@ -104,6 +108,7 @@ class PetWindow(QWidget):
         self.update()
 
     def set_visible(self, visible: bool):
+        self.single_click.stop()
         self.settings.pet_visible = visible
         self.setVisible(visible)
         if visible:
@@ -111,23 +116,30 @@ class PetWindow(QWidget):
             self._native_raise()
         self.settings_changed.emit()
 
-    def restore_pet(self):
-        self.settings.monitor = QApplication.primaryScreen().name()
+    def restore_pet(self, screen=None):
+        self.settings.monitor = (screen or QApplication.primaryScreen()).name()
         self.settings.pet_x = -1
         self.settings.pet_y = -1
         self.set_visible(True)
+
+    def restore_on_cursor_screen(self):
+        self.restore_pet(QApplication.screenAt(QCursor.pos()))
 
     def set_state(self, state: str):
         self.state = state
         self.update()
 
-    def notify(self, text: str, state="idle"):
+    def notify(self, text: str, state="idle", tasks=()):
         self.effect = ""
         self.notice = text
+        self.notice_tasks = tuple(tasks)
         self.notice_state = state
         self.notice_until = monotonic() + 6
         self.started = monotonic()
         self.update()
+
+    def _bubble(self):
+        return QRectF(7, 6, self.width() - 14, 61)
 
     def interact(self, action: str):
         self.notify("嘿嘿，摸摸头，烦恼飞走啦！" if action == "pat"
@@ -190,7 +202,7 @@ class PetWindow(QWidget):
         painter.drawPixmap(image_rect.toRect(), self.image)
         painter.restore()
         if active:
-            bubble = QRectF(7, 6, self.width() - 14, 61)
+            bubble = self._bubble()
             painter.setPen(QPen(QColor("#CCE5D9"), 1))
             painter.setBrush(QColor("#FFFFFA"))
             painter.drawRoundedRect(bubble, 16, 16)
@@ -201,8 +213,13 @@ class PetWindow(QWidget):
             painter.drawPath(tail)
             painter.setPen(QColor("#344F43"))
             painter.setFont(QFont("Microsoft YaHei UI", 9))
-            painter.drawText(bubble.adjusted(12, 7, -12, -7),
+            painter.drawText(bubble.adjusted(12, 4, -12, -21 if self.notice_tasks else -4),
                              Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap, self.notice)
+            if self.notice_tasks:
+                painter.setFont(QFont("Microsoft YaHei UI", 8))
+                painter.setPen(QColor("#35775A"))
+                painter.drawText(bubble.adjusted(8, 38, -8, -4), Qt.AlignmentFlag.AlignCenter,
+                                 "打开聊天  ›" if len(self.notice_tasks) == 1 else "选择聊天  ›")
             if self.effect:
                 painter.setFont(QFont("Segoe UI Symbol", 18))
                 painter.setPen(QColor("#E29AB4" if self.effect == "pat" else "#C89A49"))
@@ -228,6 +245,8 @@ class PetWindow(QWidget):
         self.drag_window_origin = self.pos()
         self.dragged = False
         self.double_clicked = False
+        self.pressed_tasks = self.notice_tasks if (
+            monotonic() < self.notice_until and self._bubble().contains(event.position())) else ()
 
     def mouseMoveEvent(self, event: QMouseEvent):
         if not event.buttons() & Qt.MouseButton.LeftButton:
@@ -248,14 +267,22 @@ class PetWindow(QWidget):
             self._place()
             self.settings_changed.emit()
             return
-        if not self.double_clicked:
-            self.single_click.start(QApplication.doubleClickInterval())
+        if self.double_clicked:
+            return
+        if self.pressed_tasks:
+            if (self.pressed_tasks is self.notice_tasks and monotonic() < self.notice_until
+                    and self._bubble().contains(event.position())):
+                self.notice_requested.emit(list(self.pressed_tasks))
+            return
+        self.single_click.start(QApplication.doubleClickInterval())
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self.single_click.stop()
         self.double_clicked = True
+        if self.notice_tasks and monotonic() < self.notice_until and self._bubble().contains(event.position()):
+            return
         self.open_page.emit("home")
 
     def contextMenuEvent(self, event):

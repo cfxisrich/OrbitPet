@@ -1,6 +1,45 @@
 import ctypes
+import sys
+import winreg
 from ctypes import wintypes
 from dataclasses import dataclass
+from pathlib import Path
+
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_command() -> str:
+    executable = Path(sys.executable)
+    if getattr(sys, "frozen", False):
+        return f'"{executable}" --autostart'
+    return f'"{executable.with_name("pythonw.exe")}" "{Path(__file__).resolve().with_name("app.py")}" --autostart'
+
+
+def autostart_enabled() -> bool:
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, access=winreg.KEY_QUERY_VALUE) as key:
+            command, kind = winreg.QueryValueEx(key, "OrbitPet")
+    except FileNotFoundError:
+        return False
+    return kind == winreg.REG_SZ and command.casefold() == autostart_command().casefold()
+
+
+def set_autostart(enabled: bool):
+    if autostart_enabled() == enabled:
+        return
+    if enabled:
+        command = autostart_command()
+        if len(command.encode("utf-16-le")) // 2 > 260:
+            raise OSError("启动路径过长，请将 Orbit 放到较短的路径后再开启自启。")
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, access=winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "OrbitPet", 0, winreg.REG_SZ, command)
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, access=winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, "OrbitPet")
+    except FileNotFoundError:
+        pass
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)

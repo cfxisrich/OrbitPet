@@ -27,6 +27,7 @@ class Settings:
     main_maximized: bool = False
     focus_minutes: int = 25
     break_minutes: int = 5
+    restore_shortcut: str = "Ctrl+Alt+P"
 
 
 @dataclass(frozen=True)
