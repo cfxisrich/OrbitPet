@@ -4,27 +4,50 @@ on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (vX.Y.Z)
+        required: true
+        type: string
 
 jobs:
   publish:
-    if: github.event.created
+    if: github.event_name == 'workflow_dispatch' || github.event.created
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - name: Fetch the tagged application
+        env:
+          REQUESTED_TAG: ${{ inputs.tag }}
         run: |
+          tag="${REQUESTED_TAG:-$GITHUB_REF_NAME}"
+          [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          ref="refs/tags/$tag"
           git init --quiet
-          git fetch --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$GITHUB_REF:$GITHUB_REF"
-          test "$(git rev-parse "$GITHUB_REF^{commit}")" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
-          git checkout --quiet --detach "$GITHUB_REF"
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          grep -Fx "VERSION = '${GITHUB_REF_NAME#v}'" app.py
-          git for-each-ref --format='%(contents)' "$GITHUB_REF" > "$RUNNER_TEMP/release-notes.md"
+          git fetch --depth=1 "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git" "$ref:$ref"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            test "$(git rev-parse "$ref^{commit}")" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
+          fi
+          git checkout --quiet --detach "$ref"
+          grep -Fx "VERSION = '${tag#v}'" app.py
+          git for-each-ref --format='%(contents)' "$ref" > "$RUNNER_TEMP/release-notes.md"
+          echo "RELEASE_TAG=$tag" >> "$GITHUB_ENV"
       - name: Publish the tested Windows executable
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "$GITHUB_REF_NAME" dist/OrbitPet.exe \
-            --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Orbit ${GITHUB_REF_NAME#v}" --notes-file "$RUNNER_TEMP/release-notes.md"
+          if draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
+            if [[ "$draft" == true ]]; then
+              gh release upload "$RELEASE_TAG" dist/OrbitPet.exe --repo "$GITHUB_REPOSITORY" --clobber
+              gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            fi
+          else
+            gh release create "$RELEASE_TAG" dist/OrbitPet.exe \
+              --repo "$GITHUB_REPOSITORY" --verify-tag \
+              --title "Orbit ${RELEASE_TAG#v}" --notes-file "$RUNNER_TEMP/release-notes.md"
+          fi
+          digest="sha256:$(sha256sum dist/OrbitPet.exe | cut -d' ' -f1)"
+          published=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.assets[] | select(.name == "OrbitPet.exe") | .digest')
+          test "$published" = "$digest"
