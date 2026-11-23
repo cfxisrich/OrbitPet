@@ -1,8 +1,9 @@
 from collections.abc import Callable
 from ctypes import wintypes
+from math import ceil
 from time import monotonic
 
-from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, QObject, QTimer, Signal
+from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, QObject, Qt, QTimer, Signal
 
 
 class PowerSuspendFilter(QAbstractNativeEventFilter):
@@ -32,7 +33,8 @@ class FocusTimer(QObject):
         self.remaining = 1500.0
         self.last_tick = monotonic()
         self.timer = QTimer(self)
-        self.timer.setInterval(250)
+        self.timer.setInterval(1000)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.timeout.connect(self._tick)
         self.power_filter = PowerSuspendFilter(self.pause)
         QCoreApplication.instance().installNativeEventFilter(self.power_filter)
@@ -53,7 +55,7 @@ class FocusTimer(QObject):
             self.remaining = float(self.duration)
         self.last_tick = monotonic()
         self.state = "running"
-        self.timer.start()
+        self.timer.start(min(1000, ceil(self.remaining * 1000)))
         self.changed.emit()
 
     def pause(self):
@@ -90,6 +92,8 @@ class FocusTimer(QObject):
             return
         self.remaining = max(0.0, self.remaining - elapsed)
         if self.remaining > 0:
+            if self.remaining < 1:
+                self.timer.setInterval(ceil(self.remaining * 1000))
             self.changed.emit()
             return
         self.state = "idle"

@@ -46,7 +46,14 @@ class QuickPanel(QFrame):
         layout.setSpacing(6)
         heading = QLabel("随身面板")
         heading.setObjectName("Heading")
-        layout.addWidget(heading)
+        header = QGridLayout()
+        header.addWidget(heading, 0, 0)
+        self.inbox = QPushButton()
+        self.inbox.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.inbox.clicked.connect(lambda: self._open("inbox"))
+        header.addWidget(self.inbox, 0, 1, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(header)
+        self.set_unread(0)
         self.values = {}
         self.buttons = {}
         for page, caption in (("usage", "今日 Token"), ("tasks", "执行中的 Codex 任务"), ("focus", "专注计时")):
@@ -91,6 +98,10 @@ class QuickPanel(QFrame):
 
     def set_tokens(self, total: int):
         self._set_value("usage", f"{total:,}")
+
+    def set_unread(self, count: int):
+        self.inbox.setText(f"  {count} 条未读  " if count else "  任务提醒  ")
+        self.inbox.setAccessibleName(f"任务提醒，{count} 条未读")
 
     def set_tasks(self, running: int | None):
         self._set_value("tasks", "未连接" if running is None else f"{running} 个")

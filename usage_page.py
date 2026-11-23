@@ -64,6 +64,7 @@ class UsageChart(QWidget):
 class UsagePage(QWidget):
     requested = Signal(str, str, str)
     refresh_requested = Signal()
+    chat_requested = Signal(str, str)
 
     def __init__(self):
         super().__init__()
@@ -159,6 +160,36 @@ class UsagePage(QWidget):
             self.cards.append(box)
             self.summary.addWidget(box, 0, index)
         layout.addLayout(self.summary)
+        ranking = QFrame()
+        ranking.setObjectName('Card')
+        ranking_layout = QVBoxLayout(ranking)
+        ranking_layout.setContentsMargins(18, 14, 18, 14)
+        ranking_heading = QHBoxLayout()
+        heading = QLabel('Token 消耗前五名')
+        heading.setObjectName('SectionTitle')
+        ranking_heading.addWidget(heading)
+        ranking_heading.addStretch()
+        self.rank_by = QComboBox()
+        self.rank_by.setAccessibleName('排行维度')
+        self.rank_by.addItems(('按聊天', '按模型'))
+        ranking_heading.addWidget(self.rank_by)
+        ranking_layout.addLayout(ranking_heading)
+        self.ranks = QTableWidget(0, 3)
+        self.ranks.setAccessibleName('Token 消耗排行')
+        self.ranks.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.ranks.verticalHeader().hide()
+        self.ranks.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.ranks.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.ranks.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.ranks.setShowGrid(False)
+        ranking_layout.addWidget(self.ranks)
+        self.rank_note = QLabel()
+        self.rank_note.setWordWrap(True)
+        self.rank_note.setObjectName('Muted')
+        ranking_layout.addWidget(self.rank_note)
+        self.report = None
+        self.rank_by.currentIndexChanged.connect(self._show_ranks)
+        layout.addWidget(ranking)
         trend = QFrame()
         trend.setObjectName('Card')
         trend_layout = QVBoxLayout(trend)
@@ -239,7 +270,10 @@ class UsagePage(QWidget):
             return
         self.anchor.setDate(current)
 
-    def set_report(self, report: UsageReport):
+    def set_report(self, report: UsageReport, titles=None):
+        self.report = report
+        self.chat_titles = titles or {}
+        self._show_ranks()
         for key, widget in self.values.items():
             widget.setText(f'{getattr(report.totals, key):,}')
         self.range_label.setText(f'{report.start:%Y-%m-%d} — {report.end - timedelta(days=1):%Y-%m-%d}  ·  北京时间 UTC+8')
@@ -255,6 +289,44 @@ class UsagePage(QWidget):
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.table.setItem(row, column, item)
         self.count_label.setText(f'本周期共 {report.totals.records:,} 条已记录用量 · 推理 Token {report.totals.reasoning_tokens:,}（已包含在输出中）')
+
+    def _show_ranks(self):
+        if self.report is None:
+            return
+        by_chat = self.rank_by.currentIndex() == 0
+        self.ranks.setHorizontalHeaderLabels(('聊天' if by_chat else '模型', '来源', 'Token'))
+        self.ranks.setColumnHidden(1, not by_chat)
+        self.ranks.setRowCount(0)
+        note = ''
+        if by_chat and self.report.unlinked_tokens:
+            note = f'本周期有 {self.report.unlinked_tokens:,} Token 未关联到聊天，已计入总量和模型统计。'
+        for source, chat_id, count in self.report.chats if by_chat else ():
+            row = self.ranks.rowCount()
+            self.ranks.insertRow(row)
+            if (source, chat_id) in self.chat_titles:
+                name = self.chat_titles[(source, chat_id)] or chat_id
+                button = QPushButton(name.replace('&', '&&'))
+                button.setToolTip('打开聊天 · ' + name)
+                button.setCursor(Qt.CursorShape.PointingHandCursor)
+                button.clicked.connect(lambda _, s=source, c=chat_id: self.chat_requested.emit(s, c))
+                self.ranks.setCellWidget(row, 0, button)
+            else:
+                item = QTableWidgetItem('无法定位 · ' + chat_id[:12])
+                item.setToolTip(chat_id)
+                self.ranks.setItem(row, 0, item)
+            self.ranks.setItem(row, 1, QTableWidgetItem('Codex' if source == 'codex' else '桌宠 AI'))
+            self.ranks.setItem(row, 2, QTableWidgetItem(f'{count:,}'))
+        for model, count in self.report.models if not by_chat else ():
+            row = self.ranks.rowCount()
+            self.ranks.insertRow(row)
+            self.ranks.setItem(row, 0, QTableWidgetItem(model or '未记录模型'))
+            self.ranks.setItem(row, 2, QTableWidgetItem(f'{count:,}'))
+        rows = self.ranks.rowCount()
+        self.ranks.setVisible(rows > 0)
+        self.ranks.setFixedHeight(self.ranks.horizontalHeader().sizeHint().height() +
+                                  rows * self.ranks.verticalHeader().defaultSectionSize() + 2 * self.ranks.frameWidth())
+        self.rank_note.setText(note or ('本周期暂无排行记录。' if not rows else ''))
+        self.rank_note.setVisible(bool(self.rank_note.text()))
 
     def set_status(self, text):
         self.status.setText(text)

@@ -38,6 +38,9 @@ class Storage:
                 created_at TEXT NOT NULL,
                 event_key TEXT UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS unread_task_notices (
+                event_key TEXT PRIMARY KEY REFERENCES activities(event_key) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS focus_sessions (
                 seconds INTEGER NOT NULL CHECK(seconds > 0),
                 completed_at TEXT NOT NULL
@@ -90,16 +93,32 @@ class Storage:
                             "(SELECT conversation_id FROM messages WHERE id = ?)",
                             (datetime.now(LOCAL_TIME).isoformat(), identity))
 
-    def add_activity(self, text: str, kind: str, event_key="") -> bool:
+    def add_activity(self, text: str, kind: str, event_key="", *, unread=False) -> bool:
         with self.db:
             cursor = self.db.execute(
                 "INSERT INTO activities VALUES (?, ?, ?, ?, ?) ON CONFLICT(event_key) DO NOTHING",
                 (uuid4().hex, text, kind, datetime.now(LOCAL_TIME).isoformat(), event_key or None))
+            if unread and cursor.rowcount:
+                self.db.execute("INSERT INTO unread_task_notices VALUES (?)", (event_key,))
         return cursor.rowcount == 1
 
-    def activities(self, limit=20) -> list[Activity]:
+    def activities(self, limit=20, *, task_filter="") -> list[Activity]:
+        where = {"": "", "all": "WHERE a.kind = 'task' AND a.event_key LIKE 'task:%'",
+                 "unread": "WHERE u.event_key IS NOT NULL"}[task_filter]
         return [Activity(**row) for row in self.db.execute(
-            "SELECT id, text, kind, created_at FROM activities ORDER BY rowid DESC LIMIT ?", (limit,))]
+            "SELECT a.id, a.text, a.kind, a.created_at, COALESCE(a.event_key, '') AS event_key, "
+            "u.event_key IS NOT NULL AS unread FROM activities a LEFT JOIN unread_task_notices u "
+            f"ON a.event_key = u.event_key {where} ORDER BY a.rowid DESC LIMIT ?", (limit,))]
+
+    def unread_count(self) -> int:
+        return self.db.execute("SELECT COUNT(*) FROM unread_task_notices").fetchone()[0]
+
+    def mark_tasks_read(self, event_key: str = ""):
+        with self.db:
+            if event_key:
+                self.db.execute("DELETE FROM unread_task_notices WHERE event_key = ?", (event_key,))
+                return
+            self.db.execute("DELETE FROM unread_task_notices")
 
     def add_focus_session(self, seconds: int):
         with self.db:

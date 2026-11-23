@@ -10,6 +10,10 @@ class Task:
     updated_at: str
     turn_id: str = ""
 
+    @property
+    def notice_key(self) -> str:
+        return f"task:{self.id}:{self.turn_id}:{self.state}"
+
 
 @dataclass
 class Settings:
@@ -53,6 +57,12 @@ class Activity:
     text: str
     kind: str
     created_at: str
+    event_key: str = ""
+    unread: bool = False
+
+    @property
+    def thread_id(self) -> str:
+        return self.event_key.split(":", 2)[1] if self.event_key.startswith("task:") else ""
 
 
 STATE_LABELS = {

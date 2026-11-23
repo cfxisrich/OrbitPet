@@ -26,12 +26,13 @@ from tray import TrayIcon
 from ui import MainWindow
 from usage_store import LOCAL_TIME, UsageRecord, UsageStore
 from windows import SingleInstance, autostart_enabled, set_autostart
+from updater import confirm_startup, start_install
 
 
 BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 DATA = BASE / 'data'
 CONFIG = DATA / 'settings.json'
-VERSION = '2.2.0'
+VERSION = '2.3.0'
 
 
 class Events(QObject):
@@ -78,6 +79,8 @@ class Companion(QObject):
         self.focus.restore(self.storage.get_focus())
         self.tray = TrayIcon(self)
         self.focus_state = ''
+        self.focus_stats_day = None
+        self.saved_focus = None
         self._connect()
         self.refresh_usage(*self.window.usage_page.current_query())
         self.select_chat(next((item.id for item in self.storage.conversations()), ''))
@@ -88,7 +91,7 @@ class Companion(QObject):
             self.window.show_page('home')
         self.tray.show()
         self.ticker = QTimer(self)
-        self.ticker.setInterval(100)
+        self.ticker.setInterval(500)
         self.ticker.timeout.connect(self.tick)
         self.ticker.start()
         self.checkpoint = QTimer(self)
@@ -109,6 +112,9 @@ class Companion(QObject):
         self.window.rename_chat_requested.connect(self.rename_chat)
         self.window.delete_chat_requested.connect(self.delete_chat)
         self.window.open_codex_requested.connect(self.open_codex)
+        self.window.inbox_requested.connect(self.refresh_inbox)
+        self.window.notice_open_requested.connect(self.open_recorded_notice)
+        self.window.mark_all_read_requested.connect(self.mark_all_read)
         self.window.pet_visibility_requested.connect(self.pet.set_visible)
         self.window.pet_restore_requested.connect(self.pet.restore_pet)
         self.window.pet_interact_requested.connect(self.pet.interact)
@@ -120,7 +126,9 @@ class Companion(QObject):
         self.window.autostart_refresh_requested.connect(self.refresh_autostart)
         self.window.restore_shortcut_requested.connect(self.apply_shortcut)
         self.window.quit_requested.connect(self.quit)
+        self.window.update_box.install_requested.connect(self.install_update)
         self.window.usage_requested.connect(self.refresh_usage)
+        self.window.usage_page.chat_requested.connect(self.open_usage_chat)
         self.window.usage_refresh_requested.connect(self.scan_usage)
         self.pet.open_page.connect(self.window.show_page)
         self.pet.panel_requested.connect(lambda: self.show_panel(self.pet.frameGeometry()))
@@ -174,7 +182,7 @@ class Companion(QObject):
 
     def refresh_panel_tokens(self):
         today = datetime.now(LOCAL_TIME).date()
-        self.panel.set_tokens(self.usage_store.report('day', 'all', today).totals.total_tokens)
+        self.panel.set_tokens(self.usage_store.today_total(today))
 
     @Slot(str)
     def open_panel_page(self, page):
@@ -192,7 +200,7 @@ class Companion(QObject):
     @Slot(list)
     def open_notice(self, tasks):
         if len(tasks) == 1:
-            self.open_codex(tasks[0].id)
+            self.open_recorded_notice(tasks[0].id, tasks[0].notice_key)
             return
         menu = QMenu(self.window)
         menu.setTitle('选择要打开的 Codex 聊天')
@@ -201,9 +209,25 @@ class Companion(QObject):
             title = task.title.replace('&', '&&')
             action = menu.addAction(f'{title} · {STATE_LABELS[task.state]}')
             action.setData(task.id)
-        menu.triggered.connect(lambda action: self.open_codex(action.data()))
+            action.triggered.connect(lambda checked=False, target=task:
+                                     self.open_recorded_notice(target.id, target.notice_key))
         menu.aboutToHide.connect(menu.deleteLater)
         menu.popup(QCursor.pos())
+
+    @Slot(str, str)
+    def open_recorded_notice(self, thread_id, event_key):
+        if self.open_codex(thread_id):
+            self.storage.mark_tasks_read(event_key)
+            self.refresh_activity()
+
+    @Slot()
+    def mark_all_read(self):
+        self.storage.mark_tasks_read()
+        self.refresh_activity()
+
+    @Slot(bool)
+    def refresh_inbox(self, unread_only):
+        self.window.set_inbox(self.storage.activities(-1, task_filter='unread' if unread_only else 'all'))
 
     @Slot(int)
     def set_pet_size(self, size):
@@ -251,6 +275,8 @@ class Companion(QObject):
             os.startfile('codex://threads/' + (quote(thread_id, safe='') if thread_id else 'new'))
         except OSError:
             self.window.show_error('无法打开 Codex，请确认已安装并注册 Codex 桌面应用。')
+            return False
+        return True
 
     def watch(self):
         monitor = CodexMonitor(Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))))
@@ -283,7 +309,7 @@ class Companion(QObject):
         if self.initialized:
             notices = [task for task in fresh if self.storage.add_activity(
                 task.title + ' · ' + STATE_LABELS[task.state], 'task',
-                'task:' + task.id + ':' + task.turn_id + ':' + task.state)]
+                task.notice_key, unread=True)]
             if notices:
                 text = (notices[0].title[:32] + ' · ' + STATE_LABELS[notices[0].state] if len(notices) == 1
                         else f'{len(notices)} 个 Codex 任务有结果，点击选择聊天')
@@ -317,7 +343,11 @@ class Companion(QObject):
         self.tray.notify(text, tasks)
 
     def refresh_activity(self):
-        self.window.set_activity(self.storage.activities())
+        unread = self.storage.unread_count()
+        self.window.set_activity(self.storage.activities(5), unread)
+        self.panel.set_unread(unread)
+        if self.window.current_page == 'inbox':
+            self.refresh_inbox(self.window.inbox_unread.isChecked())
 
     @Slot()
     def new_chat(self):
@@ -371,19 +401,20 @@ class Companion(QObject):
         self.active_message = self.storage.add_message(self.selected_id, 'assistant', '', 'streaming')
         self.reply_text = ''
         self.window.set_busy(True)
+        self.window.update_box.set_busy(True)
         self.window.set_conversations(self.storage.conversations(), self.selected_id)
         self.show_messages()
         self.refresh_pet()
         context = '\n'.join(task.title + ' | ' + STATE_LABELS[task.state] + ' | ' + task.detail + ' | ' + task.updated_at
                             for task in self.tasks) if include_tasks else ''
-        threading.Thread(target=self.reply, args=(self.active_message, self.settings.api_key,
+        threading.Thread(target=self.reply, args=(self.active_message, self.active_conversation, self.settings.api_key,
                          self.settings.model, messages, context), name='ai-reply', daemon=True).start()
 
-    def reply(self, identity, api_key, model, messages, context):
+    def reply(self, identity, conversation_id, api_key, model, messages, context):
         pieces = []
         try:
             for piece in stream_reply(api_key, model, messages, context, self.stopped,
-                                      on_usage=self.events.usage.emit):
+                                      on_usage=lambda record: self.events.usage.emit(replace(record, chat_id=conversation_id))):
                 if self.stopped.is_set():
                     return
                 pieces.append(piece)
@@ -411,12 +442,16 @@ class Companion(QObject):
         self.reply_text = ''
         self.reply_dirty = False
         self.window.set_busy(False)
+        self.window.update_box.set_busy(self.focus.state != 'idle')
         self.window.set_conversations(self.storage.conversations(), self.selected_id)
         self.show_messages()
         self.refresh_pet()
 
     @Slot()
     def tick(self):
+        interval = 100 if self.active_message else 500
+        if self.ticker.interval() != interval:
+            self.ticker.setInterval(interval)
         if self.instance.consume_wake():
             self.window.activate()
         if self.reply_dirty and self.selected_id == self.active_conversation:
@@ -432,9 +467,23 @@ class Companion(QObject):
 
     @Slot(str, str, str)
     def refresh_usage(self, period, source, anchor):
-        self.window.set_usage(self.usage_store.report(period, source, date.fromisoformat(anchor)))
+        report = self.usage_store.report(period, source, date.fromisoformat(anchor))
+        index = Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))) / 'state_5.sqlite'
+        self.window.usage_page.set_report(report, self.usage_store.chat_titles(report.chats, index))
         if self.panel.isVisible():
             self.refresh_panel_tokens()
+
+    @Slot(str, str)
+    def open_usage_chat(self, source, chat_id):
+        if source == 'codex':
+            self.open_codex(chat_id)
+            return
+        if not self.storage.db.execute('SELECT 1 FROM conversations WHERE id=?', (chat_id,)).fetchone():
+            self.window.show_notice('这段桌宠聊天已删除。')
+            self.refresh_usage(*self.window.usage_page.current_query())
+            return
+        self.select_chat(chat_id)
+        self.window.show_page('chat')
 
     @Slot()
     def scan_usage(self):
@@ -487,15 +536,26 @@ class Companion(QObject):
     def focus_changed(self):
         if self.closing:
             return
+        today = datetime.now(LOCAL_TIME).date()
+        if self.focus_stats_day != today:
+            self.focus_stats = self.storage.focus_stats()
+            self.focus_stats_day = today
+        self.pet.set_focus_pose(self.focus.phase if self.focus.state == 'running' else '')
         self.panel.set_focus(self.focus.phase, self.focus.state, self.focus.remaining)
-        self.window.set_focus(self.focus.phase, self.focus.state, self.focus.remaining, self.storage.focus_stats())
+        self.window.set_focus(self.focus.phase, self.focus.state, self.focus.remaining, self.focus_stats)
         if self.focus_state != self.focus.state:
+            self.window.update_box.set_busy(bool(self.active_message) or self.focus.state != 'idle')
             self.focus_state = self.focus.state
             self.persist_focus()
 
     @Slot()
     def persist_focus(self):
-        self.storage.set_focus(self.focus.snapshot())
+        snapshot = self.focus.snapshot()
+        if snapshot != self.saved_focus:
+            self.storage.set_focus(snapshot)
+            self.saved_focus = snapshot
+        if not self.closing and self.focus_stats_day != datetime.now(LOCAL_TIME).date():
+            self.focus_changed()
         if self.active_message:
             self.storage.update_message(self.active_message, self.reply_text, 'streaming')
 
@@ -503,11 +563,26 @@ class Companion(QObject):
     def focus_completed(self, phase, seconds):
         if phase == 'focus':
             self.storage.add_focus_session(seconds)
+            self.focus_stats_day = None
         text = f'完成了 {seconds // 60} 分钟' + ('专注，辛苦啦！' if phase == 'focus' else '休息，准备好了再出发。')
         self.storage.add_activity(text, 'focus')
         self.refresh_activity()
         self.focus_changed()
         self.notify(text)
+
+    @Slot()
+    def install_update(self):
+        box = self.window.update_box
+        if self.active_message or self.focus.state != 'idle':
+            box.set_busy(True)
+            return
+        try:
+            # The one-file bootloader owns the executable until its Python child has exited.
+            start_install(Path(sys.executable), box.stage, box.release.digest, os.getppid())
+        except OSError as error:
+            box.show_error(str(error))
+            return
+        self.quit()
 
     @Slot()
     def quit(self):
@@ -551,6 +626,8 @@ def main():
         try:
             companion = Companion(load_settings(CONFIG, application.screens()), instance, autostart=autostart)
         except (OSError, ValueError, sqlite3.Error) as error:
+            if os.environ.get('ORBIT_UPDATE_ID'):
+                return 1
             QMessageBox.critical(None, 'Orbit 启动失败', str(error))
             return 1
         def report_error(error_type, error, traceback):
@@ -559,6 +636,10 @@ def main():
                 return
             sys.__excepthook__(error_type, error, traceback)
         sys.excepthook = report_error
+        confirm_startup(DATA)
+        if '--update-error' in sys.argv[1:]:
+            companion.window.show_page('settings')
+            companion.window.update_box.show_error((DATA / 'updates' / 'last-error.txt').read_text('utf-8'))
         return application.exec()
     finally:
         instance.close()

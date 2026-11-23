@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
 from models import STATE_LABELS, Settings, Task
 from theme import STYLE, icon
 from usage_page import UsagePage
+from updater import UpdateBox
 
 
 ASSETS = Path(__file__).parent / "assets"
@@ -163,6 +164,9 @@ class MainWindow(QMainWindow):
     rename_chat_requested = Signal(str, str)
     delete_chat_requested = Signal(str)
     open_codex_requested = Signal(str)
+    inbox_requested = Signal(bool)
+    notice_open_requested = Signal(str, str)
+    mark_all_read_requested = Signal()
     pet_visibility_requested = Signal(bool)
     pet_size_requested = Signal(int)
     pet_topmost_requested = Signal(bool)
@@ -243,11 +247,12 @@ class MainWindow(QMainWindow):
         note_layout.addWidget(label("陪你聊天，也陪你等代码完成。", "Muted", True))
         side_layout.addWidget(self.side_note)
         side_layout.addSpacing(4)
-        self.side_footer = label("ORBIT 2.2  /  MADE FOR YOUR DAY", "Muted", True)
+        self.side_footer = label("ORBIT 2.3  /  MADE FOR YOUR DAY", "Muted", True)
         side_layout.addWidget(self.side_footer)
         shell_layout.addWidget(self.sidebar)
         shell_layout.addWidget(self.stack, 1)
         self._build_home()
+        self._build_inbox()
         self._build_chat()
         self._build_tasks()
         self.usage_page = UsagePage()
@@ -330,7 +335,12 @@ class MainWindow(QMainWindow):
         bottom = QHBoxLayout()
         bottom.setSpacing(14)
         activity_box, activity_layout = card()
-        activity_layout.addWidget(label("最近动态", "SectionTitle"))
+        activity_tools = QHBoxLayout()
+        activity_tools.addWidget(label("最近动态", "SectionTitle"))
+        activity_tools.addStretch()
+        self.inbox_entry = button("任务提醒", lambda: self._select_page("inbox"))
+        activity_tools.addWidget(self.inbox_entry)
+        activity_layout.addLayout(activity_tools)
         self.home_activity = QVBoxLayout()
         self.home_activity.setSpacing(12)
         self.home_activity.addWidget(label("这里会记录任务进展与专注时刻。", "Muted", True))
@@ -348,6 +358,48 @@ class MainWindow(QMainWindow):
         bottom.addWidget(quick_box, 2)
         layout.addLayout(bottom)
         layout.addStretch()
+
+    def _build_inbox(self):
+        layout = self._page("inbox", "任务提醒", "查看 Codex 任务的完成、失败和中断记录。")
+        tools = QHBoxLayout()
+        tools.addWidget(button("返回首页", lambda: self._select_page("home")))
+        self.inbox_unread = QCheckBox("仅看未读")
+        self.inbox_unread.setChecked(True)
+        self.inbox_unread.toggled.connect(self.inbox_requested.emit)
+        tools.addWidget(self.inbox_unread)
+        tools.addStretch()
+        self.read_all = button("全部标为已读", self.mark_all_read_requested.emit)
+        tools.addWidget(self.read_all)
+        layout.addLayout(tools)
+        self.inbox_list = QListWidget()
+        self.inbox_list.setAccessibleName("任务提醒列表")
+        self.inbox_list.setWordWrap(True)
+        self.inbox_list.itemActivated.connect(self._open_inbox_item)
+        layout.addWidget(self.inbox_list, 1)
+        self.inbox_empty = label("暂无未读提醒。", "Muted", True)
+        layout.addWidget(self.inbox_empty)
+        self.inbox_open = button("打开原聊天", lambda: self._open_inbox_item(self.inbox_list.currentItem()), True)
+        layout.addWidget(self.inbox_open)
+
+    def _open_inbox_item(self, item):
+        activity = item.data(Qt.ItemDataRole.UserRole)
+        self.notice_open_requested.emit(activity.thread_id, activity.event_key)
+
+    def set_inbox(self, activities):
+        current = self.inbox_list.currentItem()
+        selected = current.data(Qt.ItemDataRole.UserRole).id if current else ""
+        self.inbox_list.clear()
+        for index, activity in enumerate(activities):
+            status = "未读" if activity.unread else "已读"
+            stamp = activity.created_at[:16].replace("T", " ")
+            item = QListWidgetItem(f"{status}  ·  {stamp}\n{activity.text}")
+            item.setData(Qt.ItemDataRole.UserRole, activity)
+            self.inbox_list.addItem(item)
+            if not index or activity.id == selected:
+                self.inbox_list.setCurrentItem(item)
+        self.inbox_open.setEnabled(bool(activities))
+        self.inbox_empty.setVisible(not activities)
+        self.inbox_empty.setText("暂无未读提醒。" if self.inbox_unread.isChecked() else "暂无任务提醒。")
 
     def _build_chat(self):
         layout = self._page("chat", "和小新聊一聊", "想法、灵感，或者今天的小心事，都可以放在这里。")
@@ -601,7 +653,7 @@ class MainWindow(QMainWindow):
         self.set_restore_shortcut(self.settings.restore_shortcut)
         layout.addWidget(shortcut_box)
         about, about_layout = card("SoftCard", 18)
-        about_layout.addWidget(label("Orbit 2.2 · 小新桌面助手", "SectionTitle"))
+        about_layout.addWidget(label("Orbit 2.3 · 小新桌面助手", "SectionTitle"))
         about_layout.addWidget(label("历史会话、专注记录和偏好保存在本机。", "Muted", True))
         path_label = label(str(self.data_dir), "Muted", True)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -614,13 +666,19 @@ class MainWindow(QMainWindow):
         about_actions.addWidget(quit_button)
         about_layout.addLayout(about_actions)
         layout.addWidget(about)
+        self.update_box = UpdateBox(self.data_dir)
+        layout.addWidget(self.update_box)
         layout.addStretch()
 
     def _select_page(self, name):
         self.current_page = name
         self.stack.setCurrentIndex(self.pages[name])
         for page, nav in self.nav_buttons.items():
-            nav.setChecked(page == name)
+            nav.setChecked(page == ("home" if name == "inbox" else name))
+        if name == "inbox":
+            with QSignalBlocker(self.inbox_unread):
+                self.inbox_unread.setChecked(True)
+            self.inbox_requested.emit(True)
         if name == 'usage':
             self.usage_requested.emit(*self.usage_page.current_query())
         if name == 'settings':
@@ -785,12 +843,22 @@ class MainWindow(QMainWindow):
     def _open_selected_task(self):
         self.open_codex_requested.emit(self.task_list.currentItem().data(Qt.ItemDataRole.UserRole))
 
-    def set_activity(self, activities):
+    def set_activity(self, activities, unread_count=0):
+        self.inbox_entry.setText(f"任务提醒 · {unread_count} 未读" if unread_count else "任务提醒")
+        self.read_all.setEnabled(unread_count > 0)
         clear_layout(self.home_activity)
         if not activities:
             self.home_activity.addWidget(label("这里会记录任务进展与专注时刻。", "Muted", True))
             return
         for activity in activities[:5]:
+            if activity.thread_id:
+                title = ("未读 · " if activity.unread else "") + activity.text
+                entry = button(title.replace("&", "&&"), lambda checked=False, a=activity:
+                               self.notice_open_requested.emit(a.thread_id, a.event_key))
+                entry.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+                entry.setToolTip(activity.text + "\n" + activity.created_at)
+                self.home_activity.addWidget(entry)
+                continue
             entry = label("●  " + activity.text, wrap=True)
             entry.setToolTip(activity.created_at)
             self.home_activity.addWidget(entry)

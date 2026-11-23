@@ -19,16 +19,18 @@ class Checkpoint:
     model: str = ''
     totals: list[int] = field(default_factory=list)
     warnings: int = 0
+    chat_id: str = ''
 
 
 class CodexUsageImporter:
     def __init__(self, home: Path, store: UsageStore):
         self.home = home
         self.store = store
-        self.store.db.execute('''CREATE TABLE IF NOT EXISTS codex_usage_files (
+        # Older cursors lack chat IDs, so each existing log must be attributed once.
+        self.store.db.execute('''CREATE TABLE IF NOT EXISTS codex_chat_cursors (
             path TEXT PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
             offset INTEGER NOT NULL, ordinal INTEGER NOT NULL, boundary INTEGER NOT NULL,
-            model TEXT NOT NULL, totals TEXT NOT NULL, warnings INTEGER NOT NULL
+            model TEXT NOT NULL, totals TEXT NOT NULL, warnings INTEGER NOT NULL, chat_id TEXT NOT NULL
         )''')
         self.store.db.commit()
 
@@ -48,7 +50,7 @@ class CodexUsageImporter:
         for path in files:
             try:
                 imported += self._scan_file(path)
-                warnings += self.store.db.execute('SELECT warnings FROM codex_usage_files WHERE path = ?',
+                warnings += self.store.db.execute('SELECT warnings FROM codex_chat_cursors WHERE path = ?',
                                                   (str(path),)).fetchone()[0]
             except (OSError, ValueError):
                 failed += 1
@@ -60,14 +62,14 @@ class CodexUsageImporter:
 
     def _scan_file(self, path: Path) -> int:
         stat = path.stat()
-        previous = self.store.db.execute('SELECT * FROM codex_usage_files WHERE path = ?',
+        previous = self.store.db.execute('SELECT * FROM codex_chat_cursors WHERE path = ?',
                                          (str(path),)).fetchone()
         if previous is not None and previous['size'] == stat.st_size and previous['mtime_ns'] == stat.st_mtime_ns:
             return 0
         checkpoint = Checkpoint()
         if previous is not None and stat.st_size > previous['size']:
             checkpoint = Checkpoint(previous['offset'], previous['ordinal'], previous['boundary'],
-                                    previous['model'], json.loads(previous['totals']), previous['warnings'])
+                                    previous['model'], json.loads(previous['totals']), previous['warnings'], previous['chat_id'])
         records = []
         imported = 0
         with path.open('rb') as stream:
@@ -86,6 +88,10 @@ class CodexUsageImporter:
                         raise ValueError('Unexpected log record')
                     payload = record['payload']
                     if ordinal == 0 and record['type'] == 'session_meta':
+                        identity = payload.get('id', '')
+                        if not isinstance(identity, str):
+                            raise ValueError('Invalid session ID')
+                        checkpoint.chat_id = identity
                         boundary = payload.get('subagent_history_start_ordinal', 0)
                         if type(boundary) is not int or boundary < 0:
                             raise ValueError('Invalid inherited-history boundary')
@@ -130,7 +136,7 @@ class CodexUsageImporter:
                     identity = json.dumps([record['timestamp'], totals, last], separators=(',', ':'))
                     records.append(UsageRecord(hashlib.sha256(identity.encode()).hexdigest(), 'codex',
                                                int(timestamp.timestamp()), values[0], values[1], values[2],
-                                               values[3], values[4], checkpoint.model))
+                                               values[3], values[4], checkpoint.model, checkpoint.chat_id))
                     if len(records) == 200:
                         imported += self.store.add_many(records)
                         records.clear()
@@ -140,10 +146,10 @@ class CodexUsageImporter:
                     checkpoint.warnings += 1
         imported += self.store.add_many(records)
         with self.store.db:
-            self.store.db.execute('''INSERT INTO codex_usage_files VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            self.store.db.execute('''INSERT INTO codex_chat_cursors VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(path) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns,
                 offset=excluded.offset, ordinal=excluded.ordinal, boundary=excluded.boundary,
-                model=excluded.model, totals=excluded.totals, warnings=excluded.warnings''',
+                model=excluded.model, totals=excluded.totals, warnings=excluded.warnings, chat_id=excluded.chat_id''',
                 (str(path), stat.st_size, stat.st_mtime_ns, checkpoint.offset, checkpoint.ordinal,
-                 checkpoint.boundary, checkpoint.model, json.dumps(checkpoint.totals), checkpoint.warnings))
+                 checkpoint.boundary, checkpoint.model, json.dumps(checkpoint.totals), checkpoint.warnings, checkpoint.chat_id))
         return imported

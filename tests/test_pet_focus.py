@@ -103,6 +103,17 @@ class PetTests(unittest.TestCase):
         self.assertEqual(self.settings.monitor, application.primaryScreen().name())
         self.assertTrue(self.pet._screen().availableGeometry().contains(self.pet.geometry()))
 
+    def test_timer_poses_and_hidden_animation(self):
+        self.assertFalse(self.pet.animation.isActive())
+        self.pet.set_visible(True)
+        for phase in ("focus", "break", ""):
+            self.pet.set_focus_pose(phase)
+            self.assertFalse(self.pet.poses[phase].isNull())
+            self.assertEqual(self.pet.focus_pose, phase)
+        self.assertEqual(len({pose.cacheKey() for pose in self.pet.poses.values()}), 3)
+        self.pet.set_visible(False)
+        self.assertFalse(self.pet.animation.isActive())
+
     def test_native_hide_and_lost_topmost_recover(self):
         self.pet.set_visible(True)
         hwnd = int(self.pet.winId())

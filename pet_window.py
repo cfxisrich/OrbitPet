@@ -50,6 +50,13 @@ class PetWindow(QWidget):
         self.image = QPixmap()
         if not self.image.loadFromData((Path(__file__).parent / "assets/shinchan.png").read_bytes(), "PNG"):
             raise ValueError("无法读取小新角色图片。")
+        self.focus_pose = ''
+        self.poses = {'': self.image}
+        for phase, name in (('focus', 'reading'), ('break', 'stretch')):
+            pose = QPixmap(str(Path(__file__).parent / f"assets/shinchan-{name}.png"))
+            if pose.isNull():
+                raise ValueError(f"无法读取小新的动作素材：{name}")
+            self.poses[phase] = pose.scaledToWidth(640, Qt.TransformationMode.SmoothTransformation)
         self.state = "idle"
         self.notice_state = "idle"
         self.notice = ""
@@ -67,7 +74,6 @@ class PetWindow(QWidget):
         self.single_click.timeout.connect(self.panel_requested.emit)
         self.animation = QTimer(self)
         self.animation.timeout.connect(self._animate)
-        self.animation.start(250)
         self.recovery = QTimer(self)
         self.recovery.timeout.connect(self._keep_visible)
         self.recovery.start(2000)
@@ -129,11 +135,16 @@ class PetWindow(QWidget):
         self.state = state
         self.update()
 
+    def set_focus_pose(self, phase):
+        if self.focus_pose != phase:
+            self.focus_pose = phase
+            self.update()
+
     def notify(self, text: str, state="idle", tasks=()):
         self.effect = ""
         self.notice = text
         self.notice_tasks = tuple(tasks)
-        self.notice_state = state
+        self.notice_state = 'failed' if any(task.state == 'failed' for task in tasks) else state
         self.notice_until = monotonic() + 6
         self.started = monotonic()
         self.update()
@@ -166,10 +177,15 @@ class PetWindow(QWidget):
         if not user32.GetWindowLongPtrW(int(self.winId()), -20) & 0x00000008:
             self._native_raise()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.animation.start(250)
+
+    def hideEvent(self, event):
+        self.animation.stop()
+        super().hideEvent(event)
+
     def _animate(self):
-        if not self.isVisible():
-            self.animation.setInterval(500)
-            return
         active = monotonic() < self.notice_until
         self.animation.setInterval(70 if active or self.state in ("thinking", "running") else 250)
         self.update()
@@ -179,6 +195,8 @@ class PetWindow(QWidget):
         state = self.notice_state if now < self.notice_until else self.state
         elapsed = now - self.started
         active = now < self.notice_until
+        sign = active and state == 'failed' and self.notice_tasks
+        pose = '' if sign else self.focus_pose
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -195,22 +213,26 @@ class PetWindow(QWidget):
             bounce = math.sin(elapsed * 5) * 3
         image_rect = QRectF((self.width() - self.render_size) / 2 + shake,
                             77 + bounce, self.render_size, self.render_size)
+        if sign:
+            painter.setPen(QPen(QColor("#A87A50"), 5))
+            painter.drawLine(int(self.width() * 0.29), 63, int(self.width() * 0.33), int(image_rect.center().y()) + 18)
         painter.save()
         painter.translate(image_rect.center())
         painter.rotate(angle)
         painter.translate(-image_rect.center())
-        painter.drawPixmap(image_rect.toRect(), self.image)
+        painter.drawPixmap(image_rect.toRect(), self.poses[pose])
         painter.restore()
         if active:
             bubble = self._bubble()
-            painter.setPen(QPen(QColor("#CCE5D9"), 1))
-            painter.setBrush(QColor("#FFFFFA"))
+            painter.setPen(QPen(QColor("#C78A63" if sign else "#CCE5D9"), 2 if sign else 1))
+            painter.setBrush(QColor("#FFF2D9" if sign else "#FFFFFA"))
             painter.drawRoundedRect(bubble, 16, 16)
             tail = QPainterPath()
             tail.moveTo(self.width() / 2 - 6, 67)
             tail.lineTo(self.width() / 2, 75)
             tail.lineTo(self.width() / 2 + 7, 67)
-            painter.drawPath(tail)
+            if not sign:
+                painter.drawPath(tail)
             painter.setPen(QColor("#344F43"))
             painter.setFont(QFont("Microsoft YaHei UI", 9))
             painter.drawText(bubble.adjusted(12, 4, -12, -21 if self.notice_tasks else -4),
@@ -226,6 +248,8 @@ class PetWindow(QWidget):
                 painter.drawText(QRectF(self.width() - 49, 82 + bounce, 38, 38),
                                  Qt.AlignmentFlag.AlignCenter, "♥" if self.effect == "pat" else "✦")
         label = "开心" if active and self.effect else STATE_LABELS[state]
+        if pose and not active:
+            label = "专注看书" if pose == "focus" else "休息伸展"
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         chip_width = painter.fontMetrics().horizontalAdvance(label) + 34
         chip = QRectF((self.width() - chip_width) / 2, self.height() - 25, chip_width, 23)

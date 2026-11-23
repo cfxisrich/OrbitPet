@@ -31,6 +31,23 @@ class PanelRouteTests(unittest.TestCase):
         self.orbit = Companion(Settings(restore_shortcut='', pet_visible=False), instance, data, autostart=True)
         self.addCleanup(self.orbit.quit)
 
+    def test_focus_queries_once_after_completion_and_updates_pet_pose(self):
+        counts = []
+        self.orbit.storage.db.set_trace_callback(lambda sql: counts.append(sql) if 'FROM focus_sessions' in sql else None)
+        self.orbit.focus_action('start')
+        for _ in range(3):
+            self.orbit.focus_changed()
+        self.assertEqual(counts, [])
+        self.assertEqual(self.orbit.pet.focus_pose, 'focus')
+        self.orbit.focus_action('pause')
+        self.assertEqual(self.orbit.pet.focus_pose, '')
+        self.orbit.focus_completed('focus', 1500)
+        self.assertEqual(len(counts), 1)
+        self.assertEqual(self.orbit.focus_stats, (1, 1500))
+        self.orbit.focus_action('break')
+        self.orbit.focus_action('start')
+        self.assertEqual(self.orbit.pet.focus_pose, 'break')
+
     def test_metrics_land_on_matching_period_and_status(self):
         window = self.orbit.window
         now = datetime.now(LOCAL_TIME)
@@ -72,3 +89,29 @@ class PanelRouteTests(unittest.TestCase):
             self.orbit.update_tasks([Task('c', '任务 C', 'failed', '', '', 'turn3')], '已连接')
             self.assertEqual(deliver.call_count, 1)
         self.assertEqual(len(self.orbit.storage.activities()), 3)
+
+    def test_unread_inbox_deep_link_failure_and_clear(self):
+        self.orbit.settings.quiet = True
+        self.orbit.update_tasks([], '已连接')
+        a = Task('one', '项目一', 'failed', '', '', 'turn1')
+        b = Task('two', '项目二', 'completed', '', '', 'turn2')
+        self.orbit.update_tasks([a, b], '已连接')
+        self.assertIn('2 条未读', self.orbit.panel.inbox.text())
+        self.orbit.panel.inbox.click()
+        w = self.orbit.window
+        self.assertEqual((w.current_page, w.inbox_list.count()), ('inbox', 2))
+        with patch('os.startfile', side_effect=OSError), patch.object(w, 'show_error'):
+            w.inbox_open.click()
+        self.assertEqual(self.orbit.storage.unread_count(), 2)
+        with patch('os.startfile') as opened:
+            self.orbit.tray.notice_requested.emit([a, b])
+            menu = w.findChild(QMenu, options=Qt.FindChildOption.FindDirectChildrenOnly)
+            next(action for action in menu.actions() if action.data() == a.id).trigger()
+            opened.assert_called_once_with('codex://threads/one')
+            menu.hide()
+        self.assertEqual(w.inbox_list.count(), 1)
+        self.assertEqual(w.inbox_list.item(0).data(Qt.ItemDataRole.UserRole).thread_id, b.id)
+        w.read_all.click()
+        self.assertEqual((w.inbox_list.count(), self.orbit.storage.unread_count()), (0, 0))
+        w.inbox_unread.setChecked(False)
+        self.assertEqual(w.inbox_list.count(), 2)

@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import closing
 from dataclasses import astuple, dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -18,6 +19,7 @@ class UsageRecord:
     cached_tokens: int = 0
     reasoning_tokens: int = 0
     model: str = ""
+    chat_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,9 @@ class UsageReport:
     source: str
     totals: UsageTotals
     buckets: list[UsageBucket]
+    chats: list[tuple[str, str, int]]
+    models: list[tuple[str, int]]
+    unlinked_tokens: int
 
 
 class UsageStore:
@@ -67,6 +72,10 @@ class UsageStore:
                 PRIMARY KEY(source, event_key)
             );
             CREATE INDEX IF NOT EXISTS token_usage_time ON token_usage(occurred_at);
+            CREATE TABLE IF NOT EXISTS token_chat (
+                source TEXT NOT NULL, event_key TEXT NOT NULL, chat_id TEXT NOT NULL,
+                PRIMARY KEY(source, event_key)
+            ) WITHOUT ROWID;
         """)
 
     def add(self, record: UsageRecord) -> bool:
@@ -75,8 +84,12 @@ class UsageStore:
     def add_many(self, records: list[UsageRecord]) -> int:
         with self.db:
             cursor = self.db.executemany(
-                "INSERT INTO token_usage VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(source, event_key) DO NOTHING", (astuple(record) for record in records))
+                "INSERT INTO token_usage (event_key,source,occurred_at,input_tokens,output_tokens,"
+                "total_tokens,cached_tokens,reasoning_tokens,model) VALUES (?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(source, event_key) DO NOTHING", (astuple(record)[:-1] for record in records))
+            self.db.executemany("INSERT INTO token_chat(source,event_key,chat_id) VALUES (?,?,?) "
+                                "ON CONFLICT(source,event_key) DO NOTHING",
+                                ((r.source, r.event_key, r.chat_id) for r in records if r.chat_id))
         return cursor.rowcount
 
     def report(self, period: str, source: str, anchor: date) -> UsageReport:
@@ -93,6 +106,11 @@ class UsageStore:
             start = anchor.replace(day=1)
             end = (start.replace(day=28) + timedelta(days=4)).replace(day=1)
             bucket_seconds = 86400
+        with self.db:
+            self.db.execute("BEGIN")
+            return self._aggregate(start, end, period, source, bucket_seconds)
+
+    def _aggregate(self, start, end, period, source, bucket_seconds):
         start_time = int(datetime.combine(start, time(), LOCAL_TIME).timestamp())
         end_time = int(datetime.combine(end, time(), LOCAL_TIME).timestamp())
         rows = self.db.execute(
@@ -119,7 +137,42 @@ class UsageStore:
             sum(bucket.totals.reasoning_tokens for bucket in buckets),
             sum(bucket.totals.records for bucket in buckets),
         )
-        return UsageReport(start, end, period, source, totals, buckets)
+        bounds = (start_time, end_time, source, source)
+        scope = " WHERE occurred_at>=? AND occurred_at<? AND (?='all' OR source=?) "
+        linked = " FROM token_usage LEFT JOIN token_chat USING(source,event_key)"
+        chats = [tuple(row) for row in self.db.execute(
+            "SELECT source,chat_id,SUM(total_tokens) AS n" + linked + scope
+            + "AND chat_id IS NOT NULL GROUP BY source,chat_id ORDER BY n DESC,source,chat_id LIMIT 5", bounds)]
+        models = [tuple(row) for row in self.db.execute(
+            "SELECT model,SUM(total_tokens) AS n FROM token_usage" + scope + "GROUP BY model ORDER BY n DESC,model LIMIT 5", bounds)]
+        unlinked = self.db.execute("SELECT COALESCE(SUM(total_tokens),0)" + linked + scope + "AND chat_id IS NULL", bounds).fetchone()[0]
+        return UsageReport(start, end, period, source, totals, buckets, chats, models, unlinked)
+
+    def today_total(self, today: date) -> int:
+        start = int(datetime.combine(today, time(), LOCAL_TIME).timestamp())
+        return self.db.execute("SELECT COALESCE(SUM(total_tokens),0) FROM token_usage WHERE occurred_at>=? AND occurred_at<?",
+                               (start, start + 86400)).fetchone()[0]
+
+    def chat_titles(self, chats, codex_index: Path) -> dict[tuple[str, str], str]:
+        titles = {}
+        for source in ('orbit', 'codex'):
+            ids = [identity for kind, identity, _ in chats if kind == source]
+            if not ids:
+                continue
+            slots = ','.join('?' for _ in ids)
+            if source == 'orbit':
+                rows = self.db.execute(f"SELECT id,title FROM conversations WHERE id IN ({slots})", ids)
+                titles.update({(source, identity): title for identity, title in rows})
+                continue
+            if codex_index.is_file():
+                try:
+                    with closing(sqlite3.connect(codex_index.resolve().as_uri() + '?mode=ro', uri=True, timeout=.15)) as index:
+                        rows = index.execute(f"SELECT id,COALESCE(name,title) FROM threads WHERE id IN ({slots})", ids)
+                        titles.update({(source, identity): title for identity, title in rows})
+                except sqlite3.Error:
+                    # The index may be unavailable while Codex updates it; usage still has its own local copy.
+                    continue
+        return titles
 
     def close(self):
         self.db.close()

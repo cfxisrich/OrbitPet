@@ -1,4 +1,5 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
 import sys
@@ -102,6 +103,29 @@ class UsageStoreTests(unittest.TestCase):
             self.assertEqual(importing.result(), 80)
         chats.close()
         self.assertEqual(self.store.report("day", "all", date(2026, 11, 17)).totals.records, 81)
+
+    def test_rankings_respect_period_source_and_unknown_usage(self):
+        first = record('one', '2026-11-17T10:00:00+08:00')
+        self.store.add_many([replace(first, chat_id='shared'), replace(first, source='orbit', chat_id='shared'),
+                             replace(first, event_key='legacy', model=''), replace(first, event_key='two', chat_id='shared')])
+        self.store.add(replace(record('prior', '2026-11-16T02:00:00+08:00'), chat_id='prior'))
+        day = self.store.report('day', 'all', date(2026, 11, 17))
+        self.assertEqual(day.chats, [('codex', 'shared', 240), ('orbit', 'shared', 120)])
+        self.assertEqual((day.models, day.unlinked_tokens), ([('model', 360), ('', 120)], 120))
+        self.assertEqual(self.store.report('week', 'codex', day.start).chats, [('codex', 'shared', 240), ('codex', 'prior', 120)])
+        self.assertEqual(self.store.today_total(day.start), 480)
+
+    def test_orbit_renames_and_deletion_affect_links_only(self):
+        chats = Storage(self.path)
+        self.addCleanup(chats.close)
+        identity = chats.create_conversation('before')
+        self.store.add(replace(record('reply', '2026-11-17T12:00:00+08:00', 'orbit'), chat_id=identity))
+        report = self.store.report('day', 'all', date(2026, 11, 17))
+        chats.rename_conversation(identity, 'after')
+        self.assertEqual(self.store.chat_titles(report.chats, self.path), {('orbit', identity): 'after'})
+        chats.delete_conversation(identity)
+        self.assertEqual(self.store.chat_titles(report.chats, self.path), {})
+        self.assertEqual(self.store.report('day', 'orbit', report.start).chats, [('orbit', identity, 120)])
 
     def test_empty_month_has_zero_buckets_and_no_fake_records(self):
         report = self.store.report("month", "all", date(2026, 2, 8))

@@ -93,6 +93,22 @@ class UsageUITests(unittest.TestCase):
         application.processEvents()
         self.assertTrue(self.page.table.isVisible())
 
+    def test_chat_and_model_rankings_and_navigation(self):
+        now = datetime.now().timestamp()
+        self.store.add(UsageRecord('response', 'orbit', int(now), 2, 3, 5, model='Test', chat_id='chat'))
+        report = self.store.report('day', 'all', datetime.fromtimestamp(now, timezone(timedelta(hours=8))).date())
+        spy = QSignalSpy(self.page.chat_requested)
+        self.page.set_report(report, {('orbit', 'chat'): '示例 & 聊天'})
+        self.page.ranks.cellWidget(0, 0).click()
+        self.assertEqual(spy.at(0), ['orbit', 'chat'])
+        self.page.rank_by.setCurrentIndex(1)
+        self.assertEqual(self.page.ranks.item(0, 0).text(), 'Test')
+        self.assertEqual(self.page.ranks.item(0, 2).text(), '5')
+        self.page.set_report(report, {})
+        self.page.rank_by.setCurrentIndex(0)
+        self.assertIsNone(self.page.ranks.cellWidget(0, 0))
+        self.assertIn('无法定位', self.page.ranks.item(0, 0).text())
+
 
 if __name__ == '__main__':
     unittest.main()

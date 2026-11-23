@@ -1,4 +1,5 @@
 import json
+from datetime import date
 import os
 from pathlib import Path
 import shutil
@@ -48,6 +49,25 @@ class CodexUsageTests(unittest.TestCase):
 
     def rows(self):
         return list(self.store.db.execute("SELECT * FROM token_usage WHERE source='codex' ORDER BY occurred_at"))
+
+    def test_existing_log_backfills_chat_without_counting_old_events_twice(self):
+        write(self.path, [meta(), token(usage(100, 10), usage(100, 10))])
+        self.importer.scan()
+        with self.store.db:
+            self.store.db.execute('CREATE TABLE codex_usage_files AS SELECT * FROM codex_chat_cursors')
+            self.store.db.execute('ALTER TABLE codex_usage_files DROP COLUMN chat_id')
+            self.store.db.execute('DROP TABLE codex_chat_cursors')
+            self.store.db.execute('DROP TABLE token_chat')
+        reopened = UsageStore(self.home / 'usage.sqlite')
+        self.addCleanup(reopened.close)
+        importer = CodexUsageImporter(self.home, reopened)
+        self.assertIn('本次新增 0 条', importer.scan())
+        self.assertIn('本次新增 0 条', importer.scan())
+        report = reopened.report('month', 'codex', date(2026, 11, 1))
+        self.assertEqual((report.chats, report.totals.total_tokens), ([('codex', 'child', 110)], 110))
+        write(self.path, [token(usage(110, 20), usage(10, 10), '2026-11-01T03:00:00Z')], 'a')
+        self.assertIn('本次新增 1 条', importer.scan())
+        self.assertEqual(reopened.report('day', 'all', date(2026,11,1)).chats, [('codex','child',130)])
 
     def test_initial_baseline_repeats_and_increment(self):
         first = token(usage(10000, 1000, 5000, 100), usage(100, 10, 50, 1))

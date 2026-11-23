@@ -66,6 +66,29 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(len(self.store.activities()), 3)
         self.assertEqual(len(self.store.activities(1)), 1)
 
+    def test_unread_upgrade_and_reopen_preserve_original_history_and_keys(self):
+        old_key = "task:first:old-turn:completed"
+        with self.store.db:
+            self.store.db.execute("DROP TABLE unread_task_notices")
+            self.store.db.execute("INSERT INTO activities VALUES (?,?,?,?,?)",
+                                  ("legacy", "旧记录", "task", "2026-11-20", old_key))
+        self.store.close()
+        self.store = Storage(self.path)
+        self.assertEqual(self.store.unread_count(), 0)
+        self.assertEqual(self.store.activities(task_filter="all")[0].thread_id, "first")
+        for i in range(22):
+            self.store.add_activity("同一聊天的新一轮", "task", f"task:first:t{i}:completed", unread=True)
+        self.store.close()
+        self.store = Storage(self.path)
+        self.assertEqual(len(self.store.activities(-1, task_filter="unread")), 22)
+        key = "task:first:t12:completed"
+        self.store.mark_tasks_read(key)
+        self.assertFalse(self.store.add_activity("重复", "task", key, unread=True))
+        self.assertEqual(self.store.unread_count(), 21)
+        self.store.mark_tasks_read()
+        self.assertEqual(self.store.unread_count(), 0)
+        self.assertEqual(len(self.store.activities(-1, task_filter="all")), 23)
+
     def test_focus_history_and_snapshot(self):
         self.store.add_focus_session(1500)
         self.store.add_focus_session(900)
