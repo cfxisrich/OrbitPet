@@ -7,12 +7,14 @@ from PySide6.QtGui import QPainter, QPixmap
 
 OUTFITS = {
     "classic": "经典红衣", "school": "幼稚园小新", "hero": "动感超人小新", "pajama": "睡衣小新",
+    "bike": "骑车小新",
 }
 ACTIONS = {
     "classic": {},
     "school": {"wave": "帽子挥挥", "salute": "防卫队敬礼", "wiggle": "扭屁股舞"},
     "hero": {"leap": "超人登场", "beam": "动感光波", "kick": "正义飞踢"},
     "pajama": {"nap": "抱枕打瞌睡", "brush": "刷牙扭扭舞", "roll": "抱枕翻滚"},
+    "bike": {"pedal": "踩踏出发"},
 }
 
 # Cell numbers follow the artwork. Repeated cells hold the drawn pose for a beat.
@@ -26,6 +28,7 @@ TIMELINES = {
     "nap": (3.4, (0, 1, 2, 2, 2, 2, 2, 1, 0)),
     "brush": (2.5, (0, 3, 4, 5, 4, 5, 4, 5, 4, 3, 0)),
     "roll": (2.4, (0, 6, 7, 8, 8, 7, 6, 0)),
+    "pedal": (3.2, (0,) + (1, 2, 3, 7, 5, 6, 4, 8) * 3 + (0,)),
 }
 
 ASSETS = Path(__file__).parent / "assets"
@@ -71,6 +74,8 @@ class Wardrobe:
             return self.idle(outfit)
 
         sprite = self._load(outfit)[cell]
+        if action == "pedal":
+            return sprite
         frame = QPixmap(sprite.size())
         frame.fill(Qt.GlobalColor.transparent)
         painter = QPainter(frame)

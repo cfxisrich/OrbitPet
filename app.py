@@ -33,7 +33,7 @@ from updater import confirm_startup, start_install
 BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 DATA = BASE / 'data'
 CONFIG = DATA / 'settings.json'
-VERSION = '2.4.0'
+VERSION = '2.4.1'
 
 
 class Events(QObject):

@@ -121,10 +121,10 @@ class MainWindowTests(unittest.TestCase):
         self.window.outfit_requested.connect(self.window.show_outfit)
         self.window.wardrobe_action_requested.connect(self.window.preview_action)
         requests = QSignalSpy(self.window.wardrobe_action_requested)
-        self.assertEqual(set(self.window.outfit_buttons), {'classic', 'school', 'hero', 'pajama'})
+        self.assertEqual(set(self.window.outfit_buttons), {'classic', 'school', 'hero', 'pajama', 'bike'})
         self.assertTrue(self.window.classic_hint.isVisible())
         home_classic = self.window.home_pet.pixmap().toImage()
-        for outfit in ('school', 'hero', 'pajama'):
+        for outfit in ('school', 'hero', 'pajama', 'bike'):
             self.window.outfit_buttons[outfit].click()
             self.assertTrue(self.window.outfit_buttons[outfit].isChecked())
             self.assertFalse(self.window.classic_hint.isVisible())
@@ -137,7 +137,7 @@ class MainWindowTests(unittest.TestCase):
                 self.assertEqual(requests.at(requests.count() - 1), [action])
                 self.assertEqual(self.window.preview_caption.text(), title)
                 self.assertTrue(self.window.preview_timer.isActive())
-        self.assertEqual(requests.count(), 9)
+        self.assertEqual(requests.count(), 10)
         self.window.outfit_buttons['classic'].click()
         self.assertEqual(self.window.home_pet.pixmap().toImage(), home_classic)
         self.assertEqual(self.window.action_grid.count(), 0)
