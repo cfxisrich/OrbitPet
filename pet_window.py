@@ -9,6 +9,7 @@ from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QMouseEvent, QPainter, 
 from PySide6.QtWidgets import QApplication, QMenu, QWidget
 
 from models import Settings, STATE_LABELS
+from wardrobe import ACTIONS, OUTFITS, Wardrobe
 
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -35,10 +36,12 @@ class PetWindow(QWidget):
     open_page = Signal(str)
     panel_requested = Signal()
     notice_requested = Signal(list)
+    outfit_requested = Signal(str)
+    action_requested = Signal(str)
     settings_changed = Signal()
     quit_requested = Signal()
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, wardrobe=None):
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.settings = settings
@@ -47,11 +50,12 @@ class PetWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setWindowIcon(QIcon(str(Path(__file__).parent / "assets/orbit.ico")))
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.image = QPixmap()
-        if not self.image.loadFromData((Path(__file__).parent / "assets/shinchan.png").read_bytes(), "PNG"):
-            raise ValueError("无法读取小新角色图片。")
+        self.wardrobe = wardrobe or Wardrobe()
+        self.outfit = "classic"
+        self.gesture = ""
+        self.gesture_started = 0.0
         self.focus_pose = ''
-        self.poses = {'': self.image}
+        self.poses = {'': self.wardrobe.idle(self.outfit)}
         for phase, name in (('focus', 'reading'), ('break', 'stretch')):
             pose = QPixmap(str(Path(__file__).parent / f"assets/shinchan-{name}.png"))
             if pose.isNull():
@@ -140,7 +144,32 @@ class PetWindow(QWidget):
             self.focus_pose = phase
             self.update()
 
+    def set_outfit(self, key):
+        if key != self.outfit:
+            self.poses[''] = self.wardrobe.idle(key)
+            self.outfit = key
+            self.gesture = ""
+            self.update()
+
+    def perform(self, action):
+        if self.notice_tasks and monotonic() < self.notice_until:
+            return
+        if action in ("pat", "feed"):
+            self.interact(action)
+            return
+        if action not in ACTIONS[self.outfit]:
+            return
+        self.gesture = action
+        self.gesture_started = monotonic()
+        if self.effect:
+            self.effect = ""
+            self.notice_until = 0
+        if self.animation.isActive():
+            self.animation.setInterval(40)
+        self.update()
+
     def notify(self, text: str, state="idle", tasks=()):
+        self.gesture = ""
         self.effect = ""
         self.notice = text
         self.notice_tasks = tuple(tasks)
@@ -153,6 +182,8 @@ class PetWindow(QWidget):
         return QRectF(7, 6, self.width() - 14, 61)
 
     def interact(self, action: str):
+        if self.notice_tasks and monotonic() < self.notice_until:
+            return
         self.notify("嘿嘿，摸摸头，烦恼飞走啦！" if action == "pat"
                     else "小饼干收到！再陪你努力一会儿～", "completed")
         self.effect = action
@@ -186,8 +217,11 @@ class PetWindow(QWidget):
         super().hideEvent(event)
 
     def _animate(self):
-        active = monotonic() < self.notice_until
-        self.animation.setInterval(70 if active or self.state in ("thinking", "running") else 250)
+        now = monotonic()
+        if self.gesture and now - self.gesture_started >= self.wardrobe.duration(self.outfit, self.gesture):
+            self.gesture = ""
+        busy = now < self.notice_until or self.state in ("thinking", "running")
+        self.animation.setInterval(40 if self.gesture else 70 if busy else 250)
         self.update()
 
     def paintEvent(self, event):
@@ -197,6 +231,7 @@ class PetWindow(QWidget):
         active = now < self.notice_until
         sign = active and state == 'failed' and self.notice_tasks
         pose = '' if sign else self.focus_pose
+        playing = self.gesture and now - self.gesture_started < self.wardrobe.duration(self.outfit, self.gesture)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -220,7 +255,8 @@ class PetWindow(QWidget):
         painter.translate(image_rect.center())
         painter.rotate(angle)
         painter.translate(-image_rect.center())
-        painter.drawPixmap(image_rect.toRect(), self.poses[pose])
+        sprite = self.wardrobe.frame(self.outfit, self.gesture, now - self.gesture_started) if playing else self.poses[pose]
+        painter.drawPixmap(image_rect.toRect(), sprite)
         painter.restore()
         if active:
             bubble = self._bubble()
@@ -250,6 +286,8 @@ class PetWindow(QWidget):
         label = "开心" if active and self.effect else STATE_LABELS[state]
         if pose and not active:
             label = "专注看书" if pose == "focus" else "休息伸展"
+        if playing and not active:
+            label = ACTIONS[self.outfit][self.gesture]
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         chip_width = painter.fontMetrics().horizontalAdvance(label) + 34
         chip = QRectF((self.width() - chip_width) / 2, self.height() - 25, chip_width, 23)
@@ -317,12 +355,24 @@ class PetWindow(QWidget):
         menu.addAction("和小新聊聊", lambda: self.open_page.emit("chat"))
         menu.addAction("查看 Codex 任务", lambda: self.open_page.emit("tasks"))
         menu.addSeparator()
+        outfits = menu.addMenu("换造型")
+        for key, label in OUTFITS.items():
+            choice = outfits.addAction(label)
+            choice.setCheckable(True)
+            choice.setChecked(self.outfit == key)
+            choice.triggered.connect(lambda checked=False, key=key: self.outfit_requested.emit(key))
+        if ACTIONS[self.outfit]:
+            performances = menu.addMenu("演个动作")
+            for key, label in ACTIONS[self.outfit].items():
+                choice = performances.addAction(label)
+                choice.triggered.connect(lambda checked=False, key=key: self.action_requested.emit(key))
         menu.addAction("摸摸头", lambda: self.interact("pat"))
         menu.addAction("喂零食", lambda: self.interact("feed"))
         menu.addSeparator()
         menu.addAction("隐藏桌宠", lambda: self.set_visible(False))
         menu.addAction("退出 Orbit", self.quit_requested.emit)
         menu.exec(event.globalPos())
+        menu.deleteLater()
 
     def closeEvent(self, event):
         event.ignore()

@@ -1,19 +1,21 @@
 import math
 from pathlib import Path
+from time import monotonic
 
 from PySide6.QtCore import QByteArray, QRectF, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QColor, QDesktopServices, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QTextDocument
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QFrame, QHBoxLayout, QInputDialog, QKeySequenceEdit,
+    QApplication, QBoxLayout, QCheckBox, QComboBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QKeySequenceEdit,
     QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
     QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox,
-    QSplitter, QStackedWidget, QTextBrowser, QVBoxLayout, QWidget,
+    QSplitter, QStackedWidget, QTextBrowser, QToolButton, QVBoxLayout, QWidget,
 )
 
 from models import STATE_LABELS, Settings, Task
 from theme import STYLE, icon
 from usage_page import UsagePage
 from updater import UpdateBox
+from wardrobe import ACTIONS, OUTFITS, Wardrobe
 
 
 ASSETS = Path(__file__).parent / "assets"
@@ -172,6 +174,8 @@ class MainWindow(QMainWindow):
     pet_topmost_requested = Signal(bool)
     pet_restore_requested = Signal()
     pet_interact_requested = Signal(str)
+    outfit_requested = Signal(str)
+    wardrobe_action_requested = Signal(str)
     focus_action_requested = Signal(str)
     focus_config_requested = Signal(int, int)
     settings_save_requested = Signal(str, str, bool, bool, bool)
@@ -181,7 +185,7 @@ class MainWindow(QMainWindow):
     usage_requested = Signal(str, str, str)
     usage_refresh_requested = Signal()
 
-    def __init__(self, settings: Settings, data_dir: Path):
+    def __init__(self, settings: Settings, data_dir: Path, wardrobe: Wardrobe | None = None):
         super().__init__()
         self.settings = settings
         self.form_snapshot = (settings.api_key, settings.model, settings.focus_minutes,
@@ -196,8 +200,10 @@ class MainWindow(QMainWindow):
         self.scroll_positions: dict[str, int] = {}
         self.current_page = "home"
         self.geometry_ready = False
-        self.pet_image = QPixmap()
-        self.pet_image.loadFromData((ASSETS / "shinchan.png").read_bytes())
+        self.wardrobe = wardrobe if wardrobe is not None else Wardrobe()
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setInterval(50)
+        self.preview_timer.timeout.connect(self._advance_preview)
         self.setWindowTitle("Orbit · 小新桌面助手")
         self.setWindowIcon(QIcon(str(ASSETS / "orbit.ico")))
         self.setStyleSheet(STYLE)
@@ -247,7 +253,7 @@ class MainWindow(QMainWindow):
         note_layout.addWidget(label("陪你聊天，也陪你等代码完成。", "Muted", True))
         side_layout.addWidget(self.side_note)
         side_layout.addSpacing(4)
-        self.side_footer = label("ORBIT 2.3  /  MADE FOR YOUR DAY", "Muted", True)
+        self.side_footer = label("ORBIT 2.4  /  MADE FOR YOUR DAY", "Muted", True)
         side_layout.addWidget(self.side_footer)
         shell_layout.addWidget(self.sidebar)
         shell_layout.addWidget(self.stack, 1)
@@ -260,6 +266,7 @@ class MainWindow(QMainWindow):
         self.usage_page.refresh_requested.connect(self.usage_refresh_requested.emit)
         self.pages['usage'] = self.stack.addWidget(self.usage_page)
         self._build_pet()
+        self.show_outfit("classic")
         self._build_focus()
         self._build_settings()
         self._select_page("home")
@@ -314,7 +321,6 @@ class MainWindow(QMainWindow):
         row.addLayout(words, 1)
         self.home_pet = QLabel()
         self.home_pet.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.home_pet.setPixmap(self.pet_image.scaled(185, 185, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
         row.addWidget(self.home_pet)
         hero_layout.addLayout(row)
         layout.addWidget(hero)
@@ -500,24 +506,66 @@ class MainWindow(QMainWindow):
         layout.addWidget(details)
 
     def _build_pet(self):
-        layout = self._page("pet", "小新的陪伴空间", "让小新住在你喜欢的位置，陪你工作，也陪你放松。", True)
-        display, display_layout = card("Hero", 22)
+        layout = self._page("pet", "小新的陪伴空间", "选一套造型，点播小新的拿手动作。", True)
+        closet, closet_layout = card(margins=16)
+        closet_layout.addWidget(label("小新的衣橱", "SectionTitle"))
+        self.outfit_grid = QGridLayout()
+        self.outfit_grid.setSpacing(8)
+        self.outfit_buttons = {}
+        for key, title in OUTFITS.items():
+            tile = QToolButton()
+            tile.setText(title)
+            tile.setAccessibleName(title)
+            tile.setAccessibleIdentifier(f"outfit-{key}")
+            tile.setCheckable(True)
+            tile.setAutoExclusive(True)
+            tile.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextUnderIcon)
+            tile.setIcon(QIcon(self.wardrobe.idle(key)))
+            tile.setIconSize(QSize(64, 64))
+            tile.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            tile.setCursor(Qt.CursorShape.PointingHandCursor)
+            tile.setStyleSheet(
+                "QToolButton {background: #F7FAF6; border: 1px solid #DCE5DD; border-radius: 12px; padding: 5px;}"
+                "QToolButton:hover {background: #EFF7F0; border-color: #A6D4BC;}"
+                "QToolButton:checked {background: #E2F3E8; color: #216749; border: 2px solid #71B797;}"
+            )
+            tile.clicked.connect(lambda checked=False, value=key: self.outfit_requested.emit(value))
+            self.outfit_buttons[key] = tile
+            self.outfit_grid.addWidget(tile, 0, len(self.outfit_buttons) - 1)
+        self.outfit_columns = len(self.outfit_buttons)
+        closet_layout.addLayout(self.outfit_grid)
+        layout.addWidget(closet)
+        display, display_layout = card("Hero", 18)
+        self.pet_stage = QBoxLayout(QBoxLayout.Direction.LeftToRight)
+        self.pet_stage.setSpacing(16)
+        portrait = QVBoxLayout()
         self.pet_preview = QLabel()
         self.pet_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.pet_preview.setPixmap(self.pet_image.scaled(220, 220, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        display_layout.addWidget(self.pet_preview)
-        caption = label("今天也要元气满满哦！", "SectionTitle")
-        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        display_layout.addWidget(caption)
-        actions = QHBoxLayout()
-        actions.addStretch()
-        actions.addWidget(button("摸摸小新", lambda: self.pet_interact_requested.emit("pat")))
-        actions.addWidget(button("喂一份小零食", lambda: self.pet_interact_requested.emit("feed"), True))
-        actions.addStretch()
-        display_layout.addLayout(actions)
+        self.pet_preview.setFixedSize(174, 174)
+        portrait.addWidget(self.pet_preview, 0, Qt.AlignmentFlag.AlignHCenter)
+        self.preview_caption = label("", "SectionTitle")
+        self.preview_caption.setAccessibleIdentifier("wardrobe-caption")
+        self.preview_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        portrait.addWidget(self.preview_caption)
+        self.pet_stage.addLayout(portrait)
+        show = QVBoxLayout()
+        show.addWidget(label("动作放映室", "SectionTitle"))
+        self.classic_hint = label("选一套新造型，就能点播它的专属动作。", "Muted", True)
+        show.addWidget(self.classic_hint)
+        self.action_grid = QGridLayout()
+        self.action_grid.setSpacing(8)
+        show.addLayout(self.action_grid)
+        show.addStretch()
+        self.pet_stage.addLayout(show, 1)
+        display_layout.addLayout(self.pet_stage)
         layout.addWidget(display)
         preferences, pref_layout = card()
         pref_layout.addWidget(label("桌面上的小新", "SectionTitle"))
+        actions = QHBoxLayout()
+        actions.addWidget(button("摸摸小新", lambda: self.pet_interact_requested.emit("pat")))
+        actions.addWidget(button("喂一份小零食", lambda: self.pet_interact_requested.emit("feed")))
+        actions.addStretch()
+        pref_layout.addLayout(actions)
         toggles = QHBoxLayout()
         self.pet_visible = QCheckBox("显示桌面宠物")
         self.pet_visible.toggled.connect(self.pet_visibility_requested.emit)
@@ -542,6 +590,42 @@ class MainWindow(QMainWindow):
         pref_layout.addWidget(label("单击回应 · 双击打开助手 · 拖动换位置 · 右键更多操作", "Muted", True))
         layout.addWidget(preferences)
         layout.addStretch()
+
+    def show_outfit(self, key):
+        self.outfit = key
+        self.outfit_buttons[key].setChecked(True)
+        self._stop_preview()
+        self.home_pet.setPixmap(self.wardrobe.idle(key).scaled(185, 185, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        clear_layout(self.action_grid)
+        self.classic_hint.setVisible(not ACTIONS[key])
+        for index, (action, title) in enumerate(ACTIONS[key].items()):
+            play = button(title, lambda checked=False, value=action: self.wardrobe_action_requested.emit(value))
+            play.setAccessibleIdentifier(f"action-{action}")
+            self.action_grid.addWidget(play, index // 3, index % 3)
+
+    def preview_action(self, action):
+        if self.current_page != "pet" or not self.isVisible() or self.isMinimized():
+            return
+        self.preview_action_id = action
+        self.preview_started = monotonic()
+        self.preview_caption.setText(ACTIONS[self.outfit][action])
+        self._advance_preview()
+        self.preview_timer.start()
+
+    def _advance_preview(self):
+        elapsed = monotonic() - self.preview_started
+        if elapsed >= self.wardrobe.duration(self.outfit, self.preview_action_id):
+            self._stop_preview()
+            return
+        self._set_preview_image(self.wardrobe.frame(self.outfit, self.preview_action_id, elapsed))
+
+    def _stop_preview(self):
+        self.preview_timer.stop()
+        self.preview_caption.setText(OUTFITS[self.outfit])
+        self._set_preview_image(self.wardrobe.idle(self.outfit))
+
+    def _set_preview_image(self, image: QPixmap):
+        self.pet_preview.setPixmap(image.scaled(self.pet_preview.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
 
     def _build_focus(self):
         layout = self._page("focus", "留一段时间，认真做一件事", "放慢一点也没关系。每一次专注，都值得被记录。", True)
@@ -653,7 +737,7 @@ class MainWindow(QMainWindow):
         self.set_restore_shortcut(self.settings.restore_shortcut)
         layout.addWidget(shortcut_box)
         about, about_layout = card("SoftCard", 18)
-        about_layout.addWidget(label("Orbit 2.3 · 小新桌面助手", "SectionTitle"))
+        about_layout.addWidget(label("Orbit 2.4 · 小新桌面助手", "SectionTitle"))
         about_layout.addWidget(label("历史会话、专注记录和偏好保存在本机。", "Muted", True))
         path_label = label(str(self.data_dir), "Muted", True)
         path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
@@ -671,6 +755,8 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
     def _select_page(self, name):
+        if self.preview_timer.isActive() and name != "pet":
+            self._stop_preview()
         self.current_page = name
         self.stack.setCurrentIndex(self.pages[name])
         for page, nav in self.nav_buttons.items():
@@ -934,6 +1020,11 @@ class MainWindow(QMainWindow):
         event.ignore()
         self.hide()
 
+    def hideEvent(self, event):
+        if self.preview_timer.isActive():
+            self._stop_preview()
+        super().hideEvent(event)
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self.sidebar.setFixedWidth(175 if self.width() < 950 else 210)
@@ -942,6 +1033,13 @@ class MainWindow(QMainWindow):
         self.side_note.setVisible(self.height() >= 740)
         self.side_footer.setVisible(self.height() >= 680)
         self.home_pet.setVisible(self.width() >= 850)
+        compact = self.width() < 960
+        self.pet_stage.setDirection(QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight)
+        columns = 2 if self.width() < 780 else len(self.outfit_buttons)
+        if columns != self.outfit_columns:
+            self.outfit_columns = columns
+            for index, tile in enumerate(self.outfit_buttons.values()):
+                self.outfit_grid.addWidget(tile, index // columns, index % columns)
         self.remember_geometry()
 
     def moveEvent(self, event):

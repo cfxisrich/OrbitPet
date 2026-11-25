@@ -14,6 +14,7 @@ from PySide6.QtWidgets import QApplication, QMenu
 
 from app import Companion
 from models import Settings, Task
+from storage import Storage
 from usage_store import LOCAL_TIME, UsageRecord
 from windows import SingleInstance
 
@@ -47,6 +48,23 @@ class PanelRouteTests(unittest.TestCase):
         self.orbit.focus_action('break')
         self.orbit.focus_action('start')
         self.assertEqual(self.orbit.pet.focus_pose, 'break')
+
+    def test_outfit_routes_keep_hidden_pet_hidden_and_remember_selection(self):
+        window, pet = self.orbit.window, self.orbit.pet
+        self.assertEqual((window.outfit, pet.outfit), ('classic', 'classic'))
+        window.show_page('pet')
+        window.outfit_buttons['hero'].click()
+        window.wardrobe_action_requested.emit('beam')
+        self.assertEqual((window.outfit, pet.outfit), ('hero', 'hero'))
+        self.assertTrue(window.preview_timer.isActive())
+        self.assertFalse(pet.isVisible())
+        self.assertFalse(pet.gesture)
+        pet.outfit_requested.emit('school')
+        self.assertEqual((window.outfit, pet.outfit), ('school', 'school'))
+        self.assertFalse(window.preview_timer.isActive())
+        saved = Storage(self.orbit.data_dir / 'orbit.sqlite')
+        self.addCleanup(saved.close)
+        self.assertEqual(saved.pet_outfit(), 'school')
 
     def test_metrics_land_on_matching_period_and_status(self):
         window = self.orbit.window

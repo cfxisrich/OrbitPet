@@ -132,6 +132,15 @@ class Storage:
         ).fetchone()
         return row[0], row[1]
 
+    def pet_outfit(self) -> str:
+        row = self.db.execute("SELECT value FROM app_state WHERE key = 'pet_outfit'").fetchone()
+        return row[0] if row else 'classic'
+
+    def set_pet_outfit(self, outfit: str):
+        with self.db:
+            self.db.execute("INSERT INTO app_state VALUES ('pet_outfit', ?) "
+                            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (outfit,))
+
     def get_focus(self) -> dict[str, str | int | float]:
         row = self.db.execute("SELECT value FROM app_state WHERE key = 'focus'").fetchone()
         return json.loads(row[0]) if row is not None else {}

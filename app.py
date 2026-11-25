@@ -25,6 +25,7 @@ from storage import Storage
 from tray import TrayIcon
 from ui import MainWindow
 from usage_store import LOCAL_TIME, UsageRecord, UsageStore
+from wardrobe import OUTFITS, Wardrobe
 from windows import SingleInstance, autostart_enabled, set_autostart
 from updater import confirm_startup, start_install
 
@@ -32,7 +33,7 @@ from updater import confirm_startup, start_install
 BASE = Path(sys.executable if getattr(sys, 'frozen', False) else __file__).parent
 DATA = BASE / 'data'
 CONFIG = DATA / 'settings.json'
-VERSION = '2.3.0'
+VERSION = '2.4.0'
 
 
 class Events(QObject):
@@ -66,8 +67,13 @@ class Companion(QObject):
         self.reply_text = ''
         self.reply_dirty = False
         self.selected_id = ''
-        self.window = MainWindow(settings, data_dir)
-        self.pet = PetWindow(settings)
+        wardrobe = Wardrobe()
+        self.window = MainWindow(settings, data_dir, wardrobe)
+        self.pet = PetWindow(settings, wardrobe)
+        outfit = self.storage.pet_outfit()
+        selected = outfit if outfit in OUTFITS else 'classic'
+        self.window.show_outfit(selected)
+        self.pet.set_outfit(selected)
         self.panel = QuickPanel()
         self.hotkey = RestoreHotkey(self.pet.restore_on_cursor_screen)
         try:
@@ -118,6 +124,8 @@ class Companion(QObject):
         self.window.pet_visibility_requested.connect(self.pet.set_visible)
         self.window.pet_restore_requested.connect(self.pet.restore_pet)
         self.window.pet_interact_requested.connect(self.pet.interact)
+        self.window.outfit_requested.connect(self.select_outfit)
+        self.window.wardrobe_action_requested.connect(self.perform_action)
         self.window.pet_size_requested.connect(self.set_pet_size)
         self.window.pet_topmost_requested.connect(self.set_topmost)
         self.window.focus_action_requested.connect(self.focus_action)
@@ -131,6 +139,8 @@ class Companion(QObject):
         self.window.usage_page.chat_requested.connect(self.open_usage_chat)
         self.window.usage_refresh_requested.connect(self.scan_usage)
         self.pet.open_page.connect(self.window.show_page)
+        self.pet.outfit_requested.connect(self.select_outfit)
+        self.pet.action_requested.connect(self.perform_action)
         self.pet.panel_requested.connect(lambda: self.show_panel(self.pet.frameGeometry()))
         self.pet.notice_requested.connect(self.open_notice)
         self.pet.settings_changed.connect(self.pet_changed)
@@ -162,6 +172,18 @@ class Companion(QObject):
     def pet_changed(self):
         self.window.sync_settings()
         self.save()
+
+    @Slot(str)
+    def select_outfit(self, outfit):
+        self.storage.set_pet_outfit(outfit)
+        self.pet.set_outfit(outfit)
+        self.window.show_outfit(outfit)
+
+    @Slot(str)
+    def perform_action(self, action):
+        if self.pet.isVisible():
+            self.pet.perform(action)
+        self.window.preview_action(action)
 
     @Slot(str)
     def apply_shortcut(self, sequence):

@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QPushButton
 
 from models import Activity, Conversation, Message, Settings, Task
 from ui import MainWindow
+from wardrobe import ACTIONS, OUTFITS
 
 
 application = QApplication.instance() or QApplication([])
@@ -114,6 +115,56 @@ class MainWindowTests(unittest.TestCase):
         self.window.sync_settings()
         self.assertEqual(self.window.model_name.text(), 'saved-model')
         self.assertEqual(self.window.api_key.text(), 'draft-key')
+
+    def test_wardrobe_selection_and_action_buttons(self):
+        self.window.show_page('pet')
+        self.window.outfit_requested.connect(self.window.show_outfit)
+        self.window.wardrobe_action_requested.connect(self.window.preview_action)
+        requests = QSignalSpy(self.window.wardrobe_action_requested)
+        self.assertEqual(set(self.window.outfit_buttons), {'classic', 'school', 'hero', 'pajama'})
+        self.assertTrue(self.window.classic_hint.isVisible())
+        home_classic = self.window.home_pet.pixmap().toImage()
+        for outfit in ('school', 'hero', 'pajama'):
+            self.window.outfit_buttons[outfit].click()
+            self.assertTrue(self.window.outfit_buttons[outfit].isChecked())
+            self.assertFalse(self.window.classic_hint.isVisible())
+            self.assertFalse(self.window.preview_timer.isActive())
+            self.assertNotEqual(self.window.home_pet.pixmap().toImage(), home_classic)
+            for index, (action, title) in enumerate(ACTIONS[outfit].items()):
+                play = self.window.action_grid.itemAt(index).widget()
+                self.assertEqual(play.text(), title)
+                play.click()
+                self.assertEqual(requests.at(requests.count() - 1), [action])
+                self.assertEqual(self.window.preview_caption.text(), title)
+                self.assertTrue(self.window.preview_timer.isActive())
+        self.assertEqual(requests.count(), 9)
+        self.window.outfit_buttons['classic'].click()
+        self.assertEqual(self.window.home_pet.pixmap().toImage(), home_classic)
+        self.assertEqual(self.window.action_grid.count(), 0)
+        self.assertFalse(self.window.preview_timer.isActive())
+
+    def test_preview_rests_when_finished_hidden_or_navigating(self):
+        self.window.resize(740, 520)
+        self.window.show_page('pet')
+        self.window.show_outfit('hero')
+        application.processEvents()
+        page = self.window.stack.currentWidget()
+        self.assertEqual(page.horizontalScrollBar().maximum(), 0)
+        self.assertGreater(page.verticalScrollBar().maximum(), 0)
+        self.window.preview_action('beam')
+        self.window.preview_started -= self.window.wardrobe.duration('hero', 'beam')
+        self.window._advance_preview()
+        self.assertEqual(self.window.preview_caption.text(), OUTFITS['hero'])
+        self.assertFalse(self.window.preview_timer.isActive())
+        self.window.preview_action('beam')
+        self.window.show_page('home')
+        self.assertFalse(self.window.preview_timer.isActive())
+        self.window.show_page('pet')
+        self.window.preview_action('beam')
+        self.window.close()
+        self.assertFalse(self.window.preview_timer.isActive())
+        self.window.preview_action('beam')
+        self.assertFalse(self.window.preview_timer.isActive())
 
     def test_waking_minimized_window_keeps_maximized_state(self):
         self.window.showMaximized()
